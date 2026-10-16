@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.10
+// @version      1.4.11
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，內建繁體中文，附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.10';
+  const VERSION = '1.4.11';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -367,6 +367,14 @@
   const learned = p => p.moves || p.slots.flat();
   const damaging = m => m && m.kind !== 'buff';
   const control = m => !!(m.slow || m.burn || m.poison);
+  // Trails tick repeatedly; mines persist until triggered, then burst once.
+  // Status effects, falling meteors and shooting turrets are not ground residue.
+  const groundRank = m => m?.kind === 'trail' ? 2 : m?.kind === 'mine' ? 1 : 0;
+  function kitePairRank(slot) {
+    const attacks = slot.filter(damaging);
+    if (attacks.length !== 2 || !attacks.some(m => m.kind === 'projectile')) return 0;
+    return Math.max(...attacks.map(groundRank));
+  }
   function moveProfile(m) {
     const radius = m.radius || 60;
     let mode = 'ranged', reach = 300, ideal = 190;
@@ -414,10 +422,10 @@
   function fusionValue(slot) {
     const attacks = slot.filter(damaging).length;
     const stats = new Set(slot.filter(m => m.kind === 'buff').map(m => m.stat));
-    // First establish two attacks. Then reserve the remaining places for
-    // distinct buffs, strictly preferring attack, speed, then defense.
+    // Establish two attacks, preferring a projectile plus ground residue.
+    // A third attack never earns the pair bonus or displaces a useful buff.
     const buffs = stats.has('atk') * 10000 + stats.has('spd') * 1000 + stats.has('def') * 100;
-    return Math.min(2, attacks) * 1000000 + buffs
+    return Math.min(2, attacks) * 1000000 + kitePairRank(slot) * 25000 + buffs
       + Math.min(99, slotValue(slot) / 10);
   }
   function fusionChoiceValue(group, m, candidates, firstPick) {
@@ -457,6 +465,14 @@
         // Keep learned-move upgrades above new acquisitions, while collecting
         // the missing buff needed by the planned two-attack fusion.
         return ({atk:124,spd:122,def:121})[m.stat] || 35;
+      }
+      // Fill the missing kite role before redundant attacks or new buffs,
+      // below every learned upgrade. Stop once both roles are owned or the
+      // main fusion already has two attacks; do not add a third core attack.
+      const missingGround = groundRank(m) && moves.some(move => move.kind === 'projectile') && !moves.some(groundRank);
+      const missingProjectile = m.kind === 'projectile' && moves.some(groundRank) && !moves.some(move => move.kind === 'projectile');
+      if (main.filter(damaging).length < 2 && (missingGround || missingProjectile)) {
+        return 124.2 + groundRank(m) * 0.25 + clamp(moveValue(m, main),0,150) / 1000;
       }
       const strongest = main.filter(damaging).reduce((best, move) => Math.max(best, moveValue(move, main)), 0);
       const improvement = moveValue(m, main) - strongest;
