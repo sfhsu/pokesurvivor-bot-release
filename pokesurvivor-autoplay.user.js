@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.18
+// @version      1.4.19
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.18';
+  const VERSION = '1.4.19';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -177,6 +177,7 @@
   let rerollState = carry?.rerollState || {player:null,level:null,attempts:0,offers:null};
   let damagePlan = {known:false,insufficient:false}, damageHistory = [], damagePlayer = null;
   let manualUntil = 0, overSince = 0, lastThink = 0, lastStatus = 0;
+  let bondPlayer = null, originalBondOptions, hookedBondOptions;
   let originalBond, hookedBond, bondChoice = carry?.bondChoice || null;
   let turrets = [], seenCasts = new Map();
   let terrain = null, escapeState = '', objectiveScan = null;
@@ -582,7 +583,23 @@
   function fastClear() {
     return damagePlan.known && !damagePlan.insufficient && !damagePlan.crowded && damagePlan.ratio>=1.5;
   }
+  function completedCore(p) {
+    return p.slots.find(slot=>slot.length>=4 && slot.filter(damaging).length>=2) || null;
+  }
+  function lockCompletedCore(p) {
+    if (bondPlayer===p && p?.bondOptions===hookedBondOptions) return;
+    if(bondPlayer && hookedBondOptions && bondPlayer.bondOptions===hookedBondOptions) bondPlayer.bondOptions=originalBondOptions;
+    bondPlayer=p;originalBondOptions=p?.bondOptions;hookedBondOptions=null;
+    if(typeof originalBondOptions!=='function') return;
+    const nativeOptions=originalBondOptions;
+    hookedBondOptions=function(...args) {
+      if(settings.enabled && !multiplayer() && completedCore(this)) return null;
+      return nativeOptions.apply(this,args);
+    };
+    p.bondOptions=hookedBondOptions;
+  }
   function buildStep(p) {
+    if(completedCore(p)) return p.slots.length<(p.maxMoves || 4)?'fill':'passive';
     const moves=learned(p),attacks=moves.filter(damaging);
     const defense=moves.some(m=>m.kind==='buff' && m.stat==='def');
     const attackBuff=moves.some(m=>m.kind==='buff' && m.stat==='atk');
@@ -634,7 +651,24 @@
     if (c.key === 'stat:atk') return 250;
     if (c.key === 'stat:heal') return hp < 0.4 ? 300 : hp < 0.7 ? 95 : -10;
     if (c.key === 'stat:hp') {
-      if (hp < 0.5) return damagePlan.insufficient ? 215 : 190;
+      if (hp < 0.5) return completedCore(p) ? 245 : damagePlan.insufficient ? 215 : 190;
+    }
+    const core=completedCore(p);
+    if(core) {
+      const full=p.slots.length>=(p.maxMoves || 4);
+      if(c.type==='new' && m && !full && !moves.some(other=>other.id===m.id)) {
+        // Fill only after the main fusion is finished. Avoid adding more buffs
+        // when native rules already reserve both buff places for the core.
+        if(m.kind==='buff' && moves.filter(m=>m.kind==='buff').length>=2) return 12;
+        return 230+Math.min(4,moveValue(m,core)/25);
+      }
+      if(full && c.type==='stat') {
+        if(id==='def')return p.hp/p.maxHp<0.5?205:210;
+        if(id==='hp')return p.hp/p.maxHp<0.5?220:205;
+        if(id==='cd')return 185;
+        if(id==='rgn')return hp<0.7?190:175;
+      }
+      if(c.type==='up' && !core.some(other=>other.id===id)) return 70;
     }
     if (damagePlan.insufficient) {
       const gain=immediateDamageGain(c,p);
@@ -687,6 +721,7 @@
       if (p.bonds > 0 && main.length < 4) score += 27;
       // A filled roster of unused alternatives delays the core build.
       if (p.slots.length >= 3 && !(p.bonds > 0)) score -= 15;
+      if(!completedCore(p) && moves.filter(damaging).length>=2)score=Math.min(score,45);
       return Math.min(120, score);
     }
     let score = ({ hp: 126, cd: 81, rgn: hp < 0.7 ? 90 : 61, atk: 250, def: 128, mag: 50, xp: 51, spd: 53 })[id] || 20;
@@ -1810,7 +1845,7 @@
         if (p !== previousPlayer) { previousPlayer = p; lastSwitch = -Infinity; switchCommitUntil = 0; tactic = ''; terrain = null; dodgeStop = null; objectiveScan = null; trail = []; turrets = []; seenCasts.clear(); vector = [0, 0]; overSince = 0; }
         if (!settings.enabled || blocked()) { vector = [0, 0]; dodgeStop = null; }
         else {
-          if (p) {updateDamagePlan(p);choose(p, now);}
+          if (p) {lockCompletedCore(p);updateDamagePlan(p);choose(p, now);}
           if (p && !p.dead && game.Game.state === 'playing' && now - lastThink >= 60) {
             lastThink = now; steer(p, now);
           }
@@ -1861,7 +1896,7 @@
     const p = game?.Game.player;
     $('hp').textContent = p ? `${Math.ceil(p.hp)} / ${Math.ceil(p.maxHp)}` : '— / —';
     $('hp-fill').style.width = `${p ? clamp(p.hp / p.maxHp * 100, 0, 100) : 0}%`;
-    $('tactic').textContent = [tactic || '準備就緒',damagePlan.known ? `${damagePlan.phase ? '階段 '+damagePlan.phase+' · ' : ''}${damagePlan.insufficient ? '補強輸出優先' : '輸出足夠 · 強化優先'}` : ''].filter(Boolean).join(' / ');
+    $('tactic').textContent = [tactic || '準備就緒',p && completedCore(p) ? (p.slots.length<(p.maxMoves || 4)?'主技完成 · 補滿招式槽':'滿槽 · 能力成長') : '',damagePlan.known ? `${damagePlan.phase ? '階段 '+damagePlan.phase+' · ' : ''}${damagePlan.insufficient ? '補強輸出優先' : '輸出足夠 · 強化優先'}` : ''].filter(Boolean).join(' / ');
     for (let i = 0; i < 4; i++) {
       const slot = p?.slots?.[i] || [];
       $('slot-' + i).setAttribute('data-active', String(!!slot.length && i === p.active));
@@ -1875,6 +1910,8 @@
     $('rotation').textContent = [rotation || '等待目標', escapeState].filter(Boolean).join(' · ');
   }
   function detachHooks() {
+    if(bondPlayer && hookedBondOptions && bondPlayer.bondOptions===hookedBondOptions) bondPlayer.bondOptions=originalBondOptions;
+    bondPlayer=null;originalBondOptions=null;hookedBondOptions=null;
     if (!game) return;
     if (game?.Input.axis === hookedAxis) game.Input.axis = originalAxis;
     if (game?.LevelUp.offer === hookedOffer) game.LevelUp.offer = originalOffer;
