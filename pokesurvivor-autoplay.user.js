@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.7
+// @version      1.4.8
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，內建繁體中文，附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.7';
+  const VERSION = '1.4.8';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -782,15 +782,22 @@
     const step = Math.max(game.World.TS || 32, Math.min(48, p.r + 8)), r = 9, n = r * 2 + 1;
     if (terrain && now - terrain.at < 400 && distance(p, terrain.center) < step * 0.8) return terrain;
     const ox = p.x - r * step, oy = p.y - r * step;
-    const open = new Uint8Array(n * n), cover = new Uint8Array(n * n);
+    const open = new Uint8Array(n * n), cover = new Uint8Array(n * n), costs = new Float32Array(n*n);
+    const traps = [...(game.World.specialsNear?.(p.x,p.y,800) || [])]
+      .filter(o=>o.type === 'trap' && o.hp !== 0);
+    const warnings=(game.Hazards?.all || []).filter(h=>!h.hit && (h.delay ?? 0)-(h.t || 0)<4);
     for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
       const wx = ox + x * step, wy = oy + y * step, i = y * n + x;
       open[i] = game.World.isFree(wx, wy, p.r, false) ? 1 : 0;
+      const liquid = game.World.isLiquid?.(wx,wy) && game.World.liquidEffect?.(p.mon?.types || []);
+      costs[i] = (liquid ? 1/Math.max(0.1,liquid.slow || 1) + (liquid.dmg ? 12 : liquid.slide ? 0.6 : 0) : 1)
+        + (traps.some(o=>Math.hypot(wx-o.x,wy-(o.y-8))<32) ? 9 : 0)
+        + (warnings.some(h=>game.Hazards.inside(h,wx,wy,p.r+8)) ? 8 : 0);
       cover[i] = game.World.projectileBlock ? (game.World.projectileBlock(wx, wy, 3) ? 1 : 0)
         : game.World.isWall?.(wx, wy) ? 1 : 0;
     }
     open[r * n + r] = 1; // The player may already be touching an obstacle.
-    terrain = { at: now, center: { x:p.x, y:p.y }, step, n, ox, oy, open, cover,
+    terrain = { at: now, center: { x:p.x, y:p.y }, step, n, ox, oy, open, cover, costs, traps,
       allOpen:open.every(Boolean), branches:new Map() };
     return terrain;
   }
@@ -923,6 +930,16 @@
   }
   function chooseObjective(p, now, map, enemies, shots, hazards, unsafeChests) {
     if (game.Rift?.inArena) return null;
+    const rift = !multiplayer() && game.Rift?.rift;
+    const riftGoal = rift && rift.ttl > 0 ? {kind:'rift',x:rift.x,y:rift.y-10,radius:22,
+      ttl:rift.ttl,label:'前往裂縫打王'} : null;
+    if (riftGoal) {
+      objectiveWaypoint(p,riftGoal,map);
+      const travel = map.goalRoute?.travelSeconds ?? distance(p,riftGoal)/Math.max(1,p.spd || 100);
+      riftGoal.label = `前往裂縫打王 · 剩 ${Math.ceil(rift.ttl)}s / 路程約 ${Math.ceil(travel)}s`;
+      riftGoal.urgent = rift.ttl <= travel + 6;
+      if (riftGoal.urgent) { riftGoal.label = `裂縫倒數 ${Math.ceil(rift.ttl)}s · 優先進入`; return riftGoal; }
+    }
     if (!objectiveScan || now - objectiveScan.at > 700 || distance(p, objectiveScan.center) > 120) {
       const props = [...(game.World.propsInCircle?.(p.x,p.y,600) || []),
         ...(game.World.specialsNear?.(p.x,p.y,600) || [])];
@@ -944,8 +961,7 @@
       }
     }
     if (multiplayer()) return null; // Shared chests/rifts still stay manual.
-    const rift = game.Rift?.rift;
-    if (rift && rift.ttl > 0) return {kind:'rift',x:rift.x,y:rift.y - 10,radius:12,label:'前往裂縫打王'};
+    if (riftGoal) return riftGoal;
     const chest = objectiveScan.props.filter(o => {
       if (!['chest','bigchest'].includes(o.type)) return false;
       if (!(o.hp > 0) || distance(p,o) >= 650) return false;
@@ -969,22 +985,30 @@
       if (straightFree(p,site)) return site;
     }
     const start = gridIndex(map,p.x,p.y);
-    const key = `${start}:${goal.kind}:${goal.x}:${goal.y}`;
-    if (map.goalRoute?.key === key) return map.goalRoute.point;
-    const parents = new Int16Array(map.open.length).fill(-1), costs = new Uint16Array(map.open.length);
-    const queue = [start]; parents[start] = start;
-    let head = 0, best = start, bestValue = Infinity;
-    while (head < queue.length) {
-      const i = queue[head++], x = i % map.n, y = (i / map.n) | 0;
+    const key = `${start}:${goal.kind}:${goal.kind==='hunt' ? Math.round(goal.x/map.step) : goal.x}:${goal.kind==='hunt' ? Math.round(goal.y/map.step) : goal.y}`;
+    const cached = map.goalRoutes?.get(key);
+    if (cached) {map.goalRoute=cached;return cached.point;}
+    if (start < 0) return p;
+    const parents = new Int16Array(map.open.length).fill(-1), costs = new Float64Array(map.open.length).fill(Infinity);
+    const visited = new Uint8Array(map.open.length), queue = [start]; parents[start] = start; costs[start]=0;
+    let best = start, bestValue = Infinity;
+    while (queue.length) {
+      queue.sort((a,b)=>costs[b]-costs[a]);
+      const i = queue.pop(); if (visited[i]) continue; visited[i]=1;
+      const x = i % map.n, y = (i / map.n) | 0;
       const point = {x:map.ox+x*map.step,y:map.oy+y*map.step};
       const remaining = Math.max(0,distance(point,goal) - goal.radius);
-      const value = remaining + costs[i] * map.step * 0.04;
+      const value = remaining + costs[i] * 0.04;
       if (value < bestValue) {bestValue=value;best=i;}
       for (const [dx,dy] of terrainDirections) {
         const nx=x+dx,ny=y+dy,next=ny*map.n+nx;
-        if (nx<0 || ny<0 || nx>=map.n || ny>=map.n || !map.open[next] || parents[next]>=0) continue;
+        if (nx<0 || ny<0 || nx>=map.n || ny>=map.n || !map.open[next] || visited[next]) continue;
         if (dx && dy && (!map.open[y*map.n+nx] || !map.open[ny*map.n+x])) continue;
-        parents[next]=i;costs[next]=costs[i]+1;queue.push(next);
+        const nextPoint={x:map.ox+nx*map.step,y:map.oy+ny*map.step};
+        if (!straightFree({...point,r:p.r},nextPoint)) continue;
+        const cost=costs[i]+map.step*(dx && dy ? Math.SQRT2 : 1)*(map.costs[i]+map.costs[next])/2;
+        if (cost>=costs[next]) continue;
+        parents[next]=i;costs[next]=cost;queue.push(next);
       }
     }
     const path=[];
@@ -994,9 +1018,31 @@
     for (const i of path.slice(0,4)) {
       const next={x:map.ox+(i%map.n)*map.step,y:map.oy+((i/map.n)|0)*map.step};
       if (!straightFree(p,next)) break;
+      // Do not smooth a safe detour back across a slow pool or a trap.
+      const samples=Math.max(1,Math.ceil(distance(p,next)/12));
+      let expensive=false;
+      for(let s=1;s<=samples;s++) {
+        const index=gridIndex(map,p.x+(next.x-p.x)*s/samples,p.y+(next.y-p.y)*s/samples);
+        if(index>=0 && map.costs[index]>1.1) {expensive=true;break;}
+      }
+      if (expensive && point !== p) break;
       point=next;
     }
-    map.goalRoute={key,point}; return point;
+    if (distance(p,goal)<map.step*2 && straightFree(p,goal) && (!path.length || distance(point,goal)<map.step)) point=goal;
+    // Risk penalties guide the route, but must not masquerade as travel seconds.
+    const effect=game.World.liquidEffect?.(p.mon?.types || []) || {};
+    const baseSpeed=Math.max(1,(p.spd || 100)/(p.inLiquid ? effect.slow || 1 : 1));
+    let travel=0,previous=p;
+    for(const index of path) {
+      const next={x:map.ox+(index%map.n)*map.step,y:map.oy+((index/map.n)|0)*map.step};
+      const wet=game.World.isLiquid?.((previous.x+next.x)/2,(previous.y+next.y)/2);
+      travel+=distance(previous,next)/(baseSpeed*(wet ? effect.slow || 1 : 1));previous=next;
+    }
+    travel+=Math.max(0,distance(previous,goal)-goal.radius)/baseSpeed;
+    map.goalRoute={key,point,travelSeconds:travel};
+    if (!map.goalRoutes) map.goalRoutes=new Map();
+    map.goalRoutes.set(key,map.goalRoute);
+    return point;
   }
   function objectiveScore(p,q,dir,goal,waypoint) {
     const d=distance(q,goal), before=distance(p,goal);
@@ -1006,34 +1052,59 @@
       return 105 + (goal.kind==='bigchest' && !dir[0] && !dir[1] ? 24 : 0);
     }
     const progress=distance(p,waypoint)-distance(q,waypoint);
-    return progress * (goal.kind === 'altar' ? 4 : 1.6) + clamp(before-d,-35,35)*0.3
+    return progress * (goal.urgent ? 12 : goal.kind === 'hunt' ? 5 : goal.kind === 'altar' ? 4 : 3) + clamp(before-d,-35,35)*0.1
       - (before<=goal.radius ? 90 : 0);
   }
   // Predict on the ground plane used by Combat.resolve, not sprite height.
   // Extra body width takes time to clear a shot or a closing passage.
   function bodyCaution(p) { return clamp((p.r - 12) / 20, 0, 1.5); }
   function survivalHorizon(p, speed) {
-    return clamp(0.65 + 2 * p.r / Math.max(35, speed), 0.9, 1.6);
+    return clamp(0.65 + 2.8 * p.r / Math.max(25, speed), 0.9, 2.2);
   }
   function movementPlan(p, dir, speed, horizon = 0.9, stopAfter = Infinity) {
     const segments = [];
-    const slide = p.inLiquid && game.World.liquidEffect?.(p.mon?.types || []).slide;
+    const effect = game.World.liquidEffect?.(p.mon?.types || []) || {};
+    const currentSlow = p.inLiquid ? effect.slow || 1 : 1;
+    const baseSpeed = speed / currentSlow / (p.slowT > 0 ? 0.5 : 1);
+    const traps = terrain?.traps || [];
+    const dynamic = !!game.World.isLiquid || traps.length > 0 || p.slowT > 0;
+    let stickyUntil = p.slowT || 0, terrainScore = 0, trapHit = false, previousWet=!!p.inLiquid;
+    const triggeredTraps=new Set();
     let x = p.x, y = p.y, vx = p.svx || 0, vy = p.svy || 0;
-    const targetX = p.frozen ? 0 : dir[0] * speed * (slide ? 1.15 : 1);
-    const targetY = p.frozen ? 0 : dir[1] * speed * (slide ? 1.15 : 1);
     for (let start = 0; start < horizon - 1e-6;) {
+      const wet = game.World.isLiquid ? game.World.isLiquid(x,y) : p.inLiquid;
+      if (wet && !previousWet && (effect.slow || effect.dmg || effect.slide)) terrainScore -= effect.dmg ? 400 : 90;
+      previousWet=wet;
+      const slide = wet && effect.slide;
+      const pace = baseSpeed * (wet ? effect.slow || 1 : 1) * (start < stickyUntil ? 0.5 : 1);
+      const targetX = p.frozen ? 0 : dir[0] * pace * (slide ? 1.15 : 1);
+      const targetY = p.frozen ? 0 : dir[1] * pace * (slide ? 1.15 : 1);
       const tx = start < stopAfter ? targetX : 0, ty = start < stopAfter ? targetY : 0;
-      const end = Math.min(horizon,slide ? start+0.09 : horizon,start < stopAfter ? stopAfter : horizon), dt = end-start;
+      const end = Math.min(horizon,slide || dynamic ? start+0.06 : horizon,start < stopAfter ? stopAfter : horizon), dt = end-start;
       // Integrate the game's exponential ice damping; each short segment uses
       // its average velocity, so stopping does not assume instant braking.
       const k = slide ? (1-Math.exp(-1.6*dt))/(1.6*dt) : 0;
       const ax = tx+(vx-tx)*k, ay = ty+(vy-ty)*k;
       segments.push({x,y,vx:ax,vy:ay,start,end});
       x += ax*dt; y += ay*dt;
+      if (wet) terrainScore -= dt*(effect.dmg ? 1400 : effect.slow ? 90*(1/effect.slow-1) : effect.slide ? 18 : 0);
+      for (const trap of traps) {
+        if (trap.hp === 0 || triggeredTraps.has(trap)) continue;
+        // Native traps trigger within 13px of (x,y-8), independently of body radius.
+        const seg = segments[segments.length-1], dx=x-seg.x, dy=y-seg.y, vv=dx*dx+dy*dy;
+        const u=vv ? clamp(((trap.x-seg.x)*dx+(trap.y-8-seg.y)*dy)/vv,0,1) : 0;
+        if (Math.hypot(seg.x+dx*u-trap.x,seg.y+dy*u-(trap.y-8))<17) {
+          terrainScore -= trap.kind === 1 ? 900 : 1600;
+          trapHit = true;
+          triggeredTraps.add(trap);
+          if (trap.kind === 1) stickyUntil = Math.max(stickyUntil,start+3.5);
+        }
+      }
       vx = tx+(vx-tx)*Math.exp(-1.6*dt); vy = ty+(vy-ty)*Math.exp(-1.6*dt);
       start = end;
     }
-    return {segments,horizon,at(t) {
+    return {segments,horizon,terrainScore,trapHit,at(t) {
+      t = clamp(t,0,horizon);
       const seg = segments.find(s=>t<=s.end) || segments[segments.length-1];
       return {x:seg.x+seg.vx*(t-seg.start),y:seg.y+seg.vy*(t-seg.start)};
     }};
@@ -1110,6 +1181,10 @@
         const dt = Math.min(Math.hypot(a.x-x,a.y-y)-radius < 30 ? 0.08 : 0.24,plan.horizon-t);
         const b = plan.at(t+dt);
         let dx = a.x-x, dy = a.y-y, d = Math.hypot(dx,dy), pace = speed;
+        if (!e.flying && !e.legend && !e.judge && game.World.isLiquid?.(x,y)) {
+          const liquid=game.World.liquidEffect?.(e.types || []);
+          if(liquid?.slow) pace*=liquid.slow<0.5 ? 0.45 : 0.55;
+        }
         if (e.behavior === 'runner') {
           const lead = clamp(d / Math.max(60,speed),0,1.4);
           dx += (b.x-a.x)/dt*lead; dy += (b.y-a.y)/dt*lead;
@@ -1122,6 +1197,10 @@
         if (e.phase === 'aim' || e.phase === 'fuse' || e.jump) pace = 0;
         if (e.phase === 'dash' && t < (e.pt ?? 0.42)) {
           dx = e.dx || 0; dy = e.dy || 0; pace = speed*3.4;
+        }
+        if (e.behavior === 'thief') {
+          const angle=Math.atan2(-dy,-dx)+Math.sin(((e.zig || 0)+t)*2.2)*0.7;
+          dx=Math.cos(angle);dy=Math.sin(angle);pace*=d<300 ? 1 : 0.35;
         }
         const norm = Math.hypot(dx,dy) || 1;
         let nx = x + dx/norm*pace*dt, ny = y + dy/norm*pace*dt;
@@ -1143,6 +1222,24 @@
     }
     return {score,contact};
   }
+  function enteringRiftPlan(plan, goal) {
+    if (goal?.kind !== 'rift') return plan;
+    let arrival=Infinity;
+    for (const seg of plan.segments) {
+      const dx=seg.x-goal.x,dy=seg.y-goal.y,vv=seg.vx**2+seg.vy**2;
+      const c=dx*dx+dy*dy-goal.radius**2,b=dx*seg.vx+dy*seg.vy;
+      if(c<=0) {arrival=seg.start;break;}
+      const disc=b*b-vv*c;
+      if(vv>0 && b<0 && disc>=0) {
+        const t=(-b-Math.sqrt(disc))/vv;
+        if(t<=seg.end-seg.start) {arrival=seg.start+t;break;}
+      }
+    }
+    if(!Number.isFinite(arrival)) return plan;
+    const horizon=Math.max(0.001,arrival);
+    return {...plan,horizon,segments:plan.segments.filter(s=>s.start<horizon).map(s=>({...s,end:Math.min(s.end,horizon)})),
+      at:t=>plan.at(Math.min(t,horizon))};
+  }
   function steer(p, now) {
     // Replan at most 16 times/s; use analytic sweeps instead of tiny time steps.
     const liveEnemies = game.EnemyMgr.all().filter(e => !e.dead && distance(e,p) < 1200);
@@ -1156,6 +1253,11 @@
     const group = p.slots[p.active] || [];
     const primary = group.filter(damaging).reduce((best, m) => !best || moveValue(m, group) > moveValue(best, group) ? m : best, null);
     const profile = primary ? moveProfile(primary) : null;
+    const thief = !objective?.urgent && p.hp>=p.maxHp*0.35 && profile && liveEnemies
+      .filter(e=>e.behavior === 'thief' && (e.life == null || e.life>0) && distance(p,e)<650)
+      .sort((a,b)=>(distance(p,a)/(a.dex===1000 ? 1.3 : 1))-(distance(p,b)/(b.dex===1000 ? 1.3 : 1)))[0];
+    if(thief) objective={kind:'hunt',x:thief.x,y:thief.y,radius:Math.max(p.r+(thief.r || 12)+26,Math.min(125,profile.ideal)),
+      enemy:thief,label:thief.dex===1000 ? '追擊賽富豪' : '追擊喵喵'};
     for (const m of group) {
       if (m.kind === 'turret' && m.castAt != null && seenCasts.get(m) !== m.castAt) {
         seenCasts.set(m, m.castAt);
@@ -1169,7 +1271,7 @@
     turrets = turrets.filter(t => t.until > now);
     tactic = profile ? ({ close: '近距離收放', orbit: '環繞切邊', ranged: '保持射程', lure: '鋪場誘敵', turret: '砲台牽制', dash: '突進收放' })[profile.mode] : '撿物';
     const speed = p.frozen ? 0 : Math.max(0,p.spd ?? p.baseSpd ?? 100);
-    const horizon = survivalHorizon(p,speed);
+    const horizon = Math.min(survivalHorizon(p,speed),hostileShots.length || enemies.length || hazards.length ? Infinity : 1.2);
     // A fast incoming shot can be dangerous well outside the old 330px window.
     // Do not truncate by insertion order: a later shot may be the nearest hit.
     const shots = hostileShots.filter(s => (s.life == null || s.life > (s.t || 0))
@@ -1190,30 +1292,34 @@
     if (target?.kind === 'heal' && p.hp < p.maxHp * 0.35) objective = null;
     if (objective) target = null;
     const waypoint = objective ? objectiveWaypoint(p, objective, map) : null;
-    const stride = objective?.kind === 'altar'
+    let stride = objective?.kind === 'altar'
       ? clamp((distance(p,objective)-((objective.prop.r || 9)+p.r+objective.radius)/2)/Math.max(1,speed*horizon),0.06,1)
       : objective ? clamp((distance(p,objective) - objective.radius * 0.7) / (speed * 0.65), 0.12, 1) : 1;
+    if (objective && waypoint && distance(p,waypoint)>1) stride=Math.min(stride,clamp(distance(p,waypoint)/Math.max(1,speed*horizon),0.08,1));
     let best = -Infinity, result = [0, 0], exits = 8, bestUnsafe = Infinity, nextStop = null;
     const dense = enemies.length > 48 || shots.length > 128;
     const directions = !dense && (dodge || bodyCaution(p) >= 0.5) ? 32 : 16;
     // Long forecasts also try moving into a gap and braking there. Extending
     // a straight run forever can reject a safe pocket between crossing waves.
-    const brakeDirections = dodge && horizon > 1 ? 8 : 0;
-    const candidates = directions + brakeDirections;
+    const brakeDirections = dodge && horizon > 1 ? (dense ? 8 : 24) : 0;
+    const routeDirections = objective && waypoint && distance(p,waypoint)>1 ? 1 : 0;
+    const candidates = directions + brakeDirections + routeDirections;
     for (let i = 0; i <= candidates; i++) {
-      const still = i === candidates, brake = i >= directions && !still;
-      const angle = brake ? (i-directions)*Math.PI*2/brakeDirections : i*Math.PI*2/directions;
+      const still = i === candidates, route = routeDirections && i===candidates-1;
+      const brake = i >= directions && !still && !route;
+      const angle = route ? Math.atan2(waypoint.y-p.y,waypoint.x-p.x) : brake ? ((i-directions)%8)*Math.PI*2/8 : i*Math.PI*2/directions;
       // Near a chest, dodge at full speed rather than retaining opening stride.
       const pace = dodge ? 1 : stride;
       const dir = still ? [0, 0] : [Math.cos(angle) * pace, Math.sin(angle) * pace];
       const brakeAt = brake ? dodgeStop
-        ? clamp(((dodgeStop.x-p.x)*dir[0]+(dodgeStop.y-p.y)*dir[1])/Math.max(1,speed),0.01,0.9) : 0.9 : Infinity;
-      const plan = movementPlan(p,dir,speed,horizon,brakeAt);
+        ? clamp(((dodgeStop.x-p.x)*dir[0]+(dodgeStop.y-p.y)*dir[1])/Math.max(1,speed),0.01,0.9)
+        : [0.25,0.5,0.9][Math.floor((i-directions)/8)] : Infinity;
+      const plan = enteringRiftPlan(movementPlan(p,dir,speed,horizon,brakeAt),objective);
       if (plan.segments.some(seg=>!straightFree({x:seg.x,y:seg.y,r:p.r},
         {x:seg.x+seg.vx*(seg.end-seg.start),y:seg.y+seg.vy*(seg.end-seg.start)}))) continue;
       const danger = projectileDanger(p,plan,shots);
       const pursuit = pursuitDanger(p,plan,enemies,profile);
-      let score = danger.score + pursuit.score, contact = pursuit.contact;
+      let score = danger.score + pursuit.score + plan.terrainScore, contact = pursuit.contact;
       for (const t of [0.15, 0.35, 0.65]) {
         const q = plan.at(t);
         if (!still && !game.World.isFree(q.x, q.y, p.r, false)) { score -= 2000; break; }
@@ -1244,7 +1350,8 @@
           score += clamp(distance(q,chest)-distance(p,chest),-40,40)*1.2;
         }
       }
-      score += attackPosition(p, q, enemies, profile) * (objective ? 0.35 : 1);
+      score += attackPosition(p, q, enemies, profile) * (objective?.urgent ? 0 : objective?.kind==='hunt' ? 0.65 : objective ? 0.35 : 1);
+      if(thief && targetFor({x:q.x,y:q.y,r:p.r},group,enemies)===thief) score+=110;
       if (objective) score += objectiveScore(p,q,dir,objective,waypoint);
       for (const turret of turrets) {
         // Stay within support range of a recently observed deployment.
