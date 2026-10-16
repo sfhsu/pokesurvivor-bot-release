@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.17
+// @version      1.4.18
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.17';
+  const VERSION = '1.4.18';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -579,21 +579,38 @@
     const after=Math.max(0,...p.slots.map(slot=>slotDamageRate(p,slot.map(other=>other===m?copy:other))));
     return Math.max(0,after-baseline);
   }
+  function fastClear() {
+    return damagePlan.known && !damagePlan.insufficient && !damagePlan.crowded && damagePlan.ratio>=1.5;
+  }
+  function buildStep(p) {
+    const moves=learned(p),attacks=moves.filter(damaging);
+    const defense=moves.some(m=>m.kind==='buff' && m.stat==='def');
+    const attackBuff=moves.some(m=>m.kind==='buff' && m.stat==='atk');
+    if (!attacks.length) return 'attack';
+    if (fastClear()) {
+      if(attacks.length<2) return 'second';
+      if(!p.slots.some(slot=>slot.filter(damaging).length>=2)) return 'fuse';
+    }
+    if (!defense) return 'defense';
+    if (attacks.length<2) return 'second';
+    if (!attackBuff) return 'swords';
+    return 'upgrade';
+  }
   function fusionValue(slot, available = []) {
     const attackMoves = slot.filter(damaging), attacks = attackMoves.length;
     const stats = new Set(slot.filter(m => m.kind === 'buff').map(m => m.stat));
-    // Keep one damage anchor, then fuse active buffs before a second attack.
-    // Reserve two attack places: a third buff must not consume the last one.
+    // Normal: damage anchor, defense, second attack, attack buff.
+    // Fast clears combine attacks first; reserve two places for attacks.
     const excessBuffs = Math.max(0,slot.filter(m => m.kind === 'buff').length - 2);
     if (damagePlan.insufficient && (excessBuffs || attacks>2)) return -1e12;
     if (damagePlan.insufficient) return (attacks>0 ? 1000000 : 0)
       + slotDamageRate(game.Game.player,slot,true)*10000 + kitePairRank(slot)*10
       + (stats.has('atk')*4+stats.has('spd')*3+stats.has('def')*2+stats.has('regen'))*0.1;
-    const buffs = stats.has('atk') * 100000 + stats.has('spd') * 10000 + stats.has('def') * 1000;
+    const buffs = stats.has('def') * (fastClear()?100000:1000000) + stats.has('atk') * 10000 + stats.has('spd') * 1000;
     // Look ahead to a still-loose kite partner while choosing the damage
     // anchor, so early buff fusion does not lock out projectile + residue.
     const pair = attacks === 1 ? Math.max(0,...available.filter(m => !slot.includes(m)).map(m => kitePairRank([attackMoves[0],m]))) : kitePairRank(slot);
-    return (attacks > 0 ? 1000000 : 0) + (attacks >= 2 ? 200 : 0)
+    return (attacks > 0 ? 10000000 : 0) + (attacks >= 2 ? (fastClear()?1000000:100000) : 0)
       + pair * 250 + buffs - excessBuffs * 2000000
       + Math.min(99, slotValue(slot) / 10);
   }
@@ -614,13 +631,27 @@
     const id = c.key.split(':')[1];
     const m = moves.find(move => move.id === id) || game.Moves.BY_ID[id];
     const inMain = main.some(move => move.id === id);
-    if (c.key === 'stat:heal') return hp < 0.4 ? 220 : hp < 0.7 ? 95 : -10;
+    if (c.key === 'stat:atk') return 250;
+    if (c.key === 'stat:heal') return hp < 0.4 ? 300 : hp < 0.7 ? 95 : -10;
     if (c.key === 'stat:hp') {
       if (hp < 0.5) return damagePlan.insufficient ? 215 : 190;
     }
     if (damagePlan.insufficient) {
       const gain=immediateDamageGain(c,p);
       if(gain>0) return 200+12*gain/(Math.max(1,damagePlan.modeled)+gain);
+    }
+    if(c.type==='new' && m && !damagePlan.insufficient) {
+      const step=buildStep(p), buffs=moves.filter(m=>m.kind==='buff');
+      if(m.kind==='buff' && buffs.length<2 && !buffs.some(other=>other.stat===m.stat)) {
+        if(m.stat==='def') return step==='defense'?225:fastClear() && step==='fuse'?125:205;
+        if(m.stat==='atk') return step==='swords'?215:step==='fuse'?45:185;
+        // Save the two planned buff places for Harden and Swords Dance.
+        return 45;
+      }
+      if(damaging(m) && m.id!=='substitute' && moves.filter(damaging).length<2 && (groundRank(m) || moveValue(m,main)>=50)) {
+        const partner= moves.filter(damaging)[0];
+        return (step==='second'?220:210) + kitePairRank([partner,m].filter(Boolean))*5 + moveValue(m,main)/1000;
+      }
     }
     if (c.type === 'evo') return inMain ? 180 : 170;
     if (c.type === 'up') {
@@ -658,7 +689,7 @@
       if (p.slots.length >= 3 && !(p.bonds > 0)) score -= 15;
       return Math.min(120, score);
     }
-    let score = ({ hp: 57, cd: 81, rgn: hp < 0.7 ? 90 : 61, atk: 77, def: 65, mag: 50, xp: 51, spd: 53 })[id] || 20;
+    let score = ({ hp: 126, cd: 81, rgn: hp < 0.7 ? 90 : 61, atk: 250, def: 128, mag: 50, xp: 51, spd: 53 })[id] || 20;
     // Read the runtime evolution table: plan prerequisites before reaching max level.
     for (const move of main) {
       const needs = game.Moves.EVO?.[move.id]?.[1];
@@ -946,6 +977,7 @@
   }
   function buildCard(c,p) {
     const score=cardScore(c,p);
+    if(c.key==='stat:def' || c.key==='stat:hp' || c.key==='stat:atk') return true;
     if(damagePlan.insufficient) return immediateDamageGain(c,p)>0 || (c.type==='stat' && score>=119) || (c.type==='evo');
     if (c.type === 'up' || c.type === 'evo' || score >= 124) return true;
     // Evolution prerequisites and escaping a melee-only start are useful now.
@@ -5692,7 +5724,7 @@
     get diagnostics() {
       const candidate = game || capturedGame || window.G || captureCandidates[0];
       return {version:VERSION, connected:!!game, elapsedSeconds:Math.floor((performance.now()-startedAt)/1000),controlledLaunch,launchState,
-        chinese:!!localization, externalChinesePatch:!!localization?.externalPatch, background:settings.background, backgroundFrames:backgroundRunner?.frames || 0, injectionState, damage:{...damagePlan}, documentState:document.readyState || 'unknown', missing:missingInterface(candidate), captureIssue, error};
+        chinese:!!localization, externalChinesePatch:!!localization?.externalPatch, background:settings.background, backgroundFrames:backgroundRunner?.frames || 0, injectionState, damage:{...damagePlan,fastClear:fastClear(),buildStep:game?.Game.player ? buildStep(game.Game.player) : null}, documentState:document.readyState || 'unknown', missing:missingInterface(candidate), captureIssue, error};
     },
     reload: reloadBot,
     handoff() {
