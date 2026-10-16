@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.6
-// @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，可切換刷錢優先，內建繁體中文，附穩定啟動與 GF 更新入口。
+// @version      1.4.7
+// @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，內建繁體中文，附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
 // @updateURL    https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.meta.js
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.6';
+  const VERSION = '1.4.7';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -160,15 +160,20 @@
       : `等待遊戲初始化（${VERSION}）${elapsed}/30 秒 · ${detail}`;
   }
   const key = 'pokesurvivor-autoplay-v1';
-  let settings = { enabled: false, restart: false, farming: false, collapsed: false, position: null };
-  try { Object.assign(settings, JSON.parse(localStorage.getItem(key) || '{}')); } catch (_) {}
-  if (carry?.settings) Object.assign(settings, carry.settings);
+  let settings = { enabled: false, restart: false, collapsed: false, position: null };
+  const restoreSettings = saved => {
+    if (!saved || typeof saved !== 'object') return;
+    for (const name of Object.keys(settings)) {
+      if (Object.prototype.hasOwnProperty.call(saved,name)) settings[name] = saved[name];
+    }
+  };
+  try { restoreSettings(JSON.parse(localStorage.getItem(key) || '{}')); } catch (_) {}
+  restoreSettings(carry?.settings);
   let localization = null;
   let game, originalAxis, originalOffer, hookedAxis, hookedOffer;
   let dodgeStop = null;
   let vector = [0, 0], offers = carry?.offers || [], offered = carry?.offered || null, lastChoice = 0;
   let manualUntil = 0, overSince = 0, lastThink = 0, lastStatus = 0;
-  let originalItemChoice, hookedItemChoice, itemChoice = carry?.itemChoice || null;
   let originalBond, hookedBond, bondChoice = carry?.bondChoice || null;
   let turrets = [], seenCasts = new Map();
   let terrain = null, escapeState = '', objectiveScan = null;
@@ -192,7 +197,7 @@
     .summary{display:flex;flex-shrink:0;align-items:center;gap:7px;padding:0 14px 11px}.dot{width:6px;height:6px;flex:none;border-radius:50%;background:#8298ac}:host([data-running=true]) .dot{background:#7ce0c5;box-shadow:0 0 9px #7ce0c577}#status{margin:0;color:#a9c1d3;font-size:11px;overflow-wrap:anywhere}
     .body{min-height:0;overflow-y:auto;overscroll-behavior:contain;border-top:1px solid #65849a2b;padding:12px}.body[hidden]{display:none}.row{display:flex;align-items:center;justify-content:space-between;gap:8px}.label{color:#8faabe;font-size:10px;letter-spacing:1px}.hp-value{font-variant-numeric:tabular-nums;color:#c5e7d9;font-size:11px}.hp-track{height:4px;background:#2b4253;border-radius:5px;overflow:hidden;margin:6px 0 12px}.hp-fill{height:100%;width:0;background:linear-gradient(90deg,#45bca0,#a4edb9);transition:width .3s}
     #tactic{color:#d5c296;font-size:11px}.slots{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin:7px 0 12px}.slot{position:relative;min-height:62px;padding:7px 5px;border:1px solid #5b81953b;border-radius:10px;background:#0b1a2b85;overflow:hidden}.slot[data-active=true]{border-color:#7ce0c5aa;background:#244b4c77;box-shadow:inset 0 0 14px #79e8ce09}.slot-number{font-size:9px;color:#7799b0}.slot-name{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:10px;color:#dce9f2;margin:2px 0}.slot-cd{color:#8da8bd;font-size:9px;font-variant-numeric:tabular-nums}.slot[data-active=true] .slot-cd{color:#8fe2c7}.cd-track{position:absolute;height:2px;background:#68cdb1;bottom:0;left:0;width:0;transition:width .12s}
-    .rotation-note{margin:-5px 0 10px;color:#7fa6be;font-size:10px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.actions button{font-size:11px}#farm{grid-column:1/-1}#farm[aria-pressed=true]{color:#ffe2a0;border-color:#c8ac6a88;background:#4d4532}#restart[aria-pressed=true]{background:#4d4532;border-color:#c8ac6a88;color:#ffe2a0}#reload{background:#284457;color:#d8eafa}.hint{margin:9px 1px 0;color:#6f91a8;font-size:10px;text-align:center}
+    .rotation-note{margin:-5px 0 10px;color:#7fa6be;font-size:10px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.actions button{font-size:11px}#restart[aria-pressed=true]{background:#4d4532;border-color:#c8ac6a88;color:#ffe2a0}#reload{background:#284457;color:#d8eafa}.hint{margin:9px 1px 0;color:#6f91a8;font-size:10px;text-align:center}
     @media(max-height:430px){header{padding:8px 10px 6px}.body{padding:9px 10px}.slots{margin-bottom:9px}.slot{min-height:54px;padding:5px}.hp-track{margin-bottom:8px}.hint{display:none}}
     @media(prefers-reduced-motion:reduce){*{transition:none!important}}
   </style><div class="panel">
@@ -201,16 +206,15 @@
     <div class="body"><div class="row"><span class="label">HP</span><span id="hp" class="hp-value">— / —</span></div><div class="hp-track"><div id="hp-fill" class="hp-fill"></div></div>
     <div class="row"><span class="label">招式輪替</span><span id="tactic">準備就緒</span></div><div class="slots">
     ${[0, 1, 2, 3].map(i => `<div id="slot-${i}" class="slot" data-active="false"><span class="slot-number">0${i + 1}</span><span id="move-${i}" class="slot-name">空槽</span><span id="cd-${i}" class="slot-cd">—</span><div id="bar-${i}" class="cd-track"></div></div>`).join('')}
-    </div><p id="rotation" class="rotation-note">等待目標</p><div class="actions"><button id="farm" aria-pressed="false" title="優先安全金幣；健康時選護符金幣；不自動購買升級">刷錢優先：關</button><button id="restart" aria-pressed="false">自動重開：關</button><button id="reload">↻ 重新載入 Bot</button></div><a id="stable" class="update-link" href="/guia/?poke-bot-launch=1" title="重新開啟穩定入口，先準備 Bot 再載入遊戲；目前本局會結束">穩定啟動 · 重開網頁</a><a id="update" class="update-link" href="${UPDATE_URL}" target="_blank" rel="noopener noreferrer" title="開啟 Greasy Fork 最新腳本，由 Userscripts 確認更新；更新後請重整遊戲以載入新版" aria-describedby="update-note">↑ 更新版本 · Greasy Fork ↗</a><p id="update-note" class="update-note">新分頁確認更新；套用新版需重整遊戲</p><p class="hint">觸控移動優先 · 重新載入保留本局</p></div>
+    </div><p id="rotation" class="rotation-note">等待目標</p><div class="actions"><button id="restart" aria-pressed="false">自動重開：關</button><button id="reload">↻ 重新載入 Bot</button></div><a id="stable" class="update-link" href="/guia/?poke-bot-launch=1" title="重新開啟穩定入口，先準備 Bot 再載入遊戲；目前本局會結束">穩定啟動 · 重開網頁</a><a id="update" class="update-link" href="${UPDATE_URL}" target="_blank" rel="noopener noreferrer" title="開啟 Greasy Fork 最新腳本，由 Userscripts 確認更新；更新後請重整遊戲以載入新版" aria-describedby="update-note">↑ 更新版本 · Greasy Fork ↗</a><p id="update-note" class="update-note">新分頁確認更新；套用新版需重整遊戲</p><p class="hint">觸控移動優先 · 重新載入保留本局</p></div>
   </div><button id="restore" hidden aria-label="展開 Bot 面板" title="點一下展開；拖曳可移動"><span class="ball" aria-hidden="true"></span><span class="mini-dot" aria-hidden="true"></span></button>`;
   const $ = id => shadow.getElementById(id);
   const persist = () => { try { localStorage.setItem(key, JSON.stringify(settings)); } catch (_) {} };
+  persist(); // Drop retired settings while preserving the supported preferences.
   function controls() {
     $('toggle').textContent = `自動：${settings.enabled ? '開' : '關'}`;
     $('toggle').setAttribute('aria-pressed', String(settings.enabled));
     renderRestart();
-    $('farm').textContent = `刷錢優先：${settings.farming ? '開' : '關'}`;
-    $('farm').setAttribute('aria-pressed',String(!!settings.farming));
     renderReload();
     if ($('stable')) $('stable').hidden = !!game || controlledLaunch;
     root.setAttribute('data-running', String(settings.enabled));
@@ -224,7 +228,6 @@
     placePanel();
   }
   $('toggle').onclick = () => { settings.enabled = !settings.enabled; vector = [0, 0]; error = ''; persist(); controls(); };
-  $('farm').onclick = () => { settings.farming = !settings.farming; vector = [0,0]; persist(); controls(); };
   $('restart').onclick = () => { if (multiplayer()) return; settings.restart = !settings.restart; overSince = 0; persist(); controls(); };
   $('fold').onclick = () => { settings.collapsed = !settings.collapsed; persist(); controls(); };
   $('reload').onclick = () => {
@@ -348,14 +351,6 @@
       return list;
     };
     g.LevelUp.offer = hookedOffer;
-    if (typeof g.RunUI.showItemChoice === 'function') {
-      originalItemChoice = g.RunUI.showItemChoice;
-      hookedItemChoice = function(cur,next,...args) {
-        itemChoice = {cur,next};
-        return originalItemChoice.call(this,cur,next,...args);
-      };
-      g.RunUI.showItemChoice = hookedItemChoice;
-    }
     if (typeof g.RunUI.showBond === 'function') {
       originalBond = g.RunUI.showBond;
       hookedBond = function (opt, ...args) {
@@ -743,19 +738,6 @@
     }
     return score;
   }
-  function farmingItemIndex(p) {
-    if (!settings.farming || !itemChoice || itemChoice.cur !== p.item) return 0;
-    const {cur,next} = itemChoice;
-    const health = p.hp / p.maxHp;
-    const recovery = ['leftovers','shellbell','focussash','assaultvest'];
-    if (cur === 'amuletcoin') return health < 0.6 && recovery.includes(next) ? 1 : 0;
-    if (next !== 'amuletcoin' || health < 0.75) return 0;
-    // Health alone is insufficient when giving up a combat or recovery item.
-    if (game.EnemyMgr.all().some(e=>!e.dead && distance(e,p) < 220 + (e.r || 12))) return 0;
-    if (game.Projectiles.all().some(s=>!s.friendly && distance(s,p) < 250)) return 0;
-    if ((game.Hazards?.all || []).some(h=>!h.hit && game.Hazards.inside(h,p.x,p.y,p.r+20))) return 0;
-    return 1;
-  }
   function choose(p, now) {
     if (multiplayer()) return; // All upgrade, fusion and item choices stay manual in a room.
     if (now - lastChoice < 650) return;
@@ -771,8 +753,8 @@
       lastChoice = now; cards[index].click();
     } else if (visible('scr-item')) {
       const cards = [...document.querySelectorAll('#item-cards .card')];
-      const card = cards[farmingItemIndex(p)] || cards[0];
-      if (card) { lastChoice = now; itemChoice = null; card.click(); }
+      const card = cards[0];
+      if (card) { lastChoice = now; card.click(); }
     } else if (visible('scr-bond')) {
       const cards = [...document.querySelectorAll('#bond-cards .card')];
       let index = 0, candidates = [];
@@ -1201,19 +1183,11 @@
       const d = distance(item, p);
       if (d > 650) continue;
       let weight = ({ xp: 1, xpBig: 2, coin: 0.7, ticket: 5, ticket10: 9, magnet: 4, item: 2, bomb: 2 })[item.kind] || 0;
-      if (settings.farming && item.kind === 'coin') {
-        if (p.hp < p.maxHp * 0.35 || !straightFree(p,item)
-          || enemies.some(e=>distance(e,item) < p.r+(e.r || 12)+65)
-          || hazards.some(h=>game.Hazards.inside(h,item.x,item.y,p.r+16))) continue;
-        weight = 4 * Math.sqrt(clamp((item.value || 5)/5,0.5,4));
-      }
       if (item.kind === 'heal') weight = p.hp < p.maxHp * 0.8 ? 12 : 0;
-      if (settings.farming && p.hp < p.maxHp * 0.35 && item.kind === 'heal') weight = 100;
       const score = weight / (d + 65);
       if (score > targetScore) { targetScore = score; target = item; }
     }
     if (target?.kind === 'heal' && p.hp < p.maxHp * 0.35) objective = null;
-    if (settings.farming && objective?.kind !== 'altar' && target?.kind === 'coin' && distance(p,target) < 180) objective = null;
     if (objective) target = null;
     const waypoint = objective ? objectiveWaypoint(p, objective, map) : null;
     const stride = objective?.kind === 'altar'
@@ -1371,7 +1345,7 @@
     const p = game?.Game.player;
     $('hp').textContent = p ? `${Math.ceil(p.hp)} / ${Math.ceil(p.maxHp)}` : '— / —';
     $('hp-fill').style.width = `${p ? clamp(p.hp / p.maxHp * 100, 0, 100) : 0}%`;
-    $('tactic').textContent = (settings.farming ? '刷錢 · ' : '') + (tactic || '準備就緒');
+    $('tactic').textContent = tactic || '準備就緒';
     for (let i = 0; i < 4; i++) {
       const slot = p?.slots?.[i] || [];
       $('slot-' + i).setAttribute('data-active', String(!!slot.length && i === p.active));
@@ -1388,7 +1362,6 @@
     if (!game) return;
     if (game?.Input.axis === hookedAxis) game.Input.axis = originalAxis;
     if (game?.LevelUp.offer === hookedOffer) game.LevelUp.offer = originalOffer;
-    if (hookedItemChoice && game?.RunUI.showItemChoice === hookedItemChoice) game.RunUI.showItemChoice = originalItemChoice;
     if (hookedBond && game?.RunUI.showBond === hookedBond) game.RunUI.showBond = originalBond;
   }
   function reloadBot() {
@@ -5210,7 +5183,7 @@
     },
     reload: reloadBot,
     handoff() {
-      const state = { game: game || capturedGame, offers, offered, bondChoice, itemChoice, settings: { ...settings } };
+      const state = { game: game || capturedGame, offers, offered, bondChoice, settings: { ...settings } };
       api.destroy();
       return state;
     },
