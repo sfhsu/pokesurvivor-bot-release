@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.8
+// @version      1.4.9
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，內建繁體中文，附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.8';
+  const VERSION = '1.4.9';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -177,6 +177,9 @@
   let originalBond, hookedBond, bondChoice = carry?.bondChoice || null;
   let turrets = [], seenCasts = new Map();
   let terrain = null, escapeState = '', objectiveScan = null;
+  let projectileCoverCache = new Map();
+  let coverLifetimeCache = new Map();
+  let chestSiteCache = new WeakMap();
   const terrainDirections = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
   let lastSwitch = -Infinity, switchCommitUntil = 0, tactic = '', rotation = '', reloadUntil = 0;
   let previousPlayer = null, trail = [], error = '', stopped = false;
@@ -901,32 +904,121 @@
       return straightFree({x:site.x,y:site.y,r:p.r},{x:site.x+dx*scale,y:site.y+dy*scale});
     }).length;
   }
-  function chestSafe(p, chest, map, enemies, shots, hazards) {
+  function propDetour(a,b,prop,radius) {
+    const da=distance(a,prop),db=distance(b,prop),direct=distance(a,b);
+    if(da<=radius || db<=radius) return direct;
+    const angle=Math.acos(clamp(((a.x-prop.x)*(b.x-prop.x)+(a.y-prop.y)*(b.y-prop.y))/(da*db),-1,1));
+    const arc=angle-Math.acos(radius/da)-Math.acos(radius/db);
+    return arc>0 ? Math.sqrt(da*da-radius*radius)+Math.sqrt(db*db-radius*radius)+radius*arc : direct;
+  }
+  function projectileBlockedAt(s, horizon) {
+    if (!game.World.projectileBlock) return Infinity;
+    const limit=Math.max(0,Math.min(horizon,s.life == null ? horizon : s.life-(s.t || 0)));
+    const vx=s.vx || 0,vy=s.vy || 0,r=s.r ?? 6;
+    const key=`${s.x}:${s.y}:${vx}:${vy}:${r}`;
+    const cached=projectileCoverCache.get(key);
+    if(cached && cached.limit>=limit && !(cached.prop?.hp<=0)
+      && cached.hp===cached.prop?.hp && cached.open===cached.prop?.open) return cached.at<=limit ? cached.at : Infinity;
+    const speed=Math.hypot(vx,vy),steps=Math.max(1,Math.ceil(speed*limit/Math.max(2,Math.min(5,r))));
+    let blocked=Infinity,prop=null;
+    for(let i=0;i<=steps;i++) {
+      const t=limit*i/steps,hit=game.World.projectileBlock(s.x+vx*t,s.y+vy*t,r);
+      if(hit && (typeof hit!=='object' || (!(hit.hp<=0) && t<coverLifetime(hit)))) {blocked=t;prop=hit;break;}
+    }
+    projectileCoverCache.set(key,{at:blocked,limit,prop,hp:prop?.hp,open:prop?.open});return blocked;
+  }
+  function coverLifetime(prop) {
+    if(prop.type==='bigchest') return Math.max(0,3.5-(prop.open || 0));
+    if(!Number.isFinite(prop.hp)) return Infinity;
+    const cached=coverLifetimeCache.get(prop);
+    if(cached?.hp===prop.hp) return cached.time;
+    const hits=[];
+    for(const s of game.Projectiles.all()) {
+      if(!s.friendly || s.orb || s.gone) continue;
+      const vx=s.vx || 0,vy=s.vy || 0,vv=vx*vx+vy*vy;
+      if(!vv) continue;
+      const dx=s.x-prop.x,dy=s.y-prop.y,b=dx*vx+dy*vy,c=dx*dx+dy*dy-((s.r || 6)+(prop.r || 12))**2;
+      const disc=b*b-vv*c;
+      if(disc<0 || (b>=0 && c>0)) continue;
+      const t=Math.max(0,(-b-Math.sqrt(disc))/vv);
+      if(t<=(s.life ?? Infinity)-(s.t || 0)) hits.push({t,damage:s.dmg || 0});
+    }
+    hits.sort((a,b)=>a.t-b.t);
+    let hp=prop.hp,time=Infinity;
+    for(const hit of hits) if((hp-=hit.damage)<=0){time=hit.t;break;}
+    // Opening by our next cast can remove ordinary cover before an incoming shot.
+    const player=game.Game.player;
+    if(player?.target===prop) for(const move of player.slots?.[player.active] || []) {
+      if(!damaging(move)) continue;
+      const damage=(move.dmg || 0)*(player.atk || player.atkMul || 1)*Math.max(1,move.count || 1);
+      if(damage>=prop.hp) time=Math.min(time,Math.max(0,move.t || 0)+Math.max(0,distance(player,prop)-player.r-(prop.r || 12))/Math.max(1,move.speed || 350));
+    }
+    coverLifetimeCache.set(prop,{hp:prop.hp,time});return time;
+  }
+  function chestSafe(p, chest, map, enemies, shots, hazards, siteOverride = null) {
     if (p.hp < p.maxHp * (chest.type === 'altar' ? 0.2 : 0.35)) return false;
     const locked = chest.type === 'bigchest', d = distance(p, chest);
     const radius = chest.type === 'altar' ? Math.max(30,(chest.r || 9)+p.r+14)-3
       : locked ? Math.max(46, (chest.r || 14) + p.r + 24) - 7 : Math.max((chest.r || 12) + p.r + 8, 42);
     const scale = d > radius ? (d - radius * 0.85) / d : 0;
-    const site = {x:p.x + (chest.x-p.x)*scale,y:p.y + (chest.y-p.y)*scale};
+    const site = siteOverride || {x:p.x + (chest.x-p.x)*scale,y:p.y + (chest.y-p.y)*scale};
     // Locked chests require 3.5 seconds of exposure. Check both the current
     // position and the intended interaction spot on every decision, not scan.
     const horizon = chest.type === 'altar' ? 0.65 : locked ? 3.8 : 1.2;
-    for (const q of [p, site]) {
+    for (const q of siteOverride ? [site] : [p, site]) {
       for (const e of enemies) {
         const gap = distance(q,e) - p.r - (e.r || 12);
         if (gap < 25) return false;
-        if ((e.flying || gridLine(map,q,e)) && gap < 40 + Math.max(0,e.spd ?? 60)*horizon) return false;
+        const route=chest.type === 'altar' || e.flying ? distance(q,e)
+          : propDetour(e,q,chest,(chest.r || 12)+(e.r || 12));
+        if ((chest.type !== 'altar' || e.flying || gridLine(map,q,e))
+          && route-p.r-(e.r || 12) < 40 + Math.max(0,e.spd ?? 60)*horizon) return false;
       }
       for (const s of shots) {
         const vx = s.vx || 0, vy = s.vy || 0, vv = vx*vx+vy*vy;
-        const t = vv ? clamp(((q.x-s.x)*vx+(q.y-s.y)*vy)/vv,0,horizon) : 0;
+        const alive=Math.max(0,Math.min(horizon,s.life == null ? horizon : s.life-(s.t || 0)));
+        if(!alive) continue;
+        const closest=vv ? clamp(((q.x-s.x)*vx+(q.y-s.y)*vy)/vv,0,alive) : 0;
+        if(Math.hypot(q.x-s.x-vx*closest,q.y-s.y-vy*closest)>=p.r+(s.r || 6)+22) continue;
+        const blocked=projectileBlockedAt(s,closest);
+        const t = Math.min(closest,blocked);
         if (Math.hypot(q.x-s.x-vx*t,q.y-s.y-vy*t) < p.r+(s.r || 6)+22) return false;
       }
       if (hazards.some(h => game.Hazards.inside(h,q.x,q.y,p.r+16))) return false;
     }
     if (distance(p,site) < map.step*6
-      && (chest.type === 'altar' ? altarExits(p,site,map) : terrainPosition(p,site,[0,0],enemies,null,map).safeExits) < 2) return false;
+      && (chest.type === 'altar' || siteOverride ? altarExits(p,site,map) : terrainPosition(p,site,[0,0],enemies,null,map).safeExits) < 2) return false;
     return true;
+  }
+  function chestSite(p,chest,map,enemies,shots,hazards) {
+    const now=performance.now(),cached=chestSiteCache.get(chest);
+    if(cached && now-cached.at<150 && distance(p,cached.origin)<32
+      && game.World.isFree(cached.site.x,cached.site.y,p.r,false)
+      && chestSafe(p,chest,map,enemies,shots,hazards,cached.site)) return cached.site;
+    const inner=(chest.r || 12)+p.r+3;
+    const outer=chest.type==='bigchest' ? Math.max(46,(chest.r || 14)+p.r+24)-4 : Math.max(42,inner+8);
+    const radius=inner+(outer-inner)*0.65,base=Math.atan2(p.y-chest.y,p.x-chest.x);
+    let best=null,bestScore=-Infinity;
+    for(let i=0;i<16;i++) {
+      const angle=base+i*Math.PI/8,q={x:chest.x+Math.cos(angle)*radius,y:chest.y+Math.sin(angle)*radius};
+      if(!game.World.isFree(q.x,q.y,p.r,false) || !chestSafe(p,chest,map,enemies,shots,hazards,q)) continue;
+      let cover=0;
+      for(const e of enemies.filter(e=>e.behavior==='ranged' && distance(e,q)<600).slice(0,12)) {
+        const shot={x:e.x,y:e.y,vx:q.x-e.x,vy:q.y-e.y,r:3,life:1};
+        if(projectileBlockedAt(shot,1)<1) cover++;
+      }
+      for(const s of shots) {
+        const vx=s.vx || 0,vy=s.vy || 0,vv=vx*vx+vy*vy;
+        const t=vv ? ((q.x-s.x)*vx+(q.y-s.y)*vy)/vv : -1;
+        if(t>0 && t<3.8 && Math.hypot(q.x-s.x-vx*t,q.y-s.y-vy*t)<p.r+(s.r || 6)+12
+          && projectileBlockedAt(s,t)<t) cover++;
+      }
+      const cost=propDetour(p,q,chest,inner);
+      const score=cover*35-cost*0.35;
+      if(score>bestScore) {best={...q,cover,ring:radius};bestScore=score;}
+    }
+    if(best) chestSiteCache.set(chest,{at:now,origin:{x:p.x,y:p.y},site:best});
+    return best;
   }
   function chooseObjective(p, now, map, enemies, shots, hazards, unsafeChests) {
     if (game.Rift?.inArena) return null;
@@ -962,21 +1054,43 @@
     }
     if (multiplayer()) return null; // Shared chests/rifts still stay manual.
     if (riftGoal) return riftGoal;
+    const sites=new Map();
     const chest = objectiveScan.props.filter(o => {
       if (!['chest','bigchest'].includes(o.type)) return false;
       if (!(o.hp > 0) || distance(p,o) >= 650) return false;
-      if (chestSafe(p,o,map,enemies,shots,hazards)) return true;
+      const site=chestSite(p,o,map,enemies,shots,hazards);
+      if (site) {sites.set(o,site);return true;}
       if (o.type === 'bigchest') unsafeChests.push(o);
       return false;
     })
       .sort((a,b) => distance(p,a) / (a.type === 'bigchest' ? 1.4 : 1) - distance(p,b) / (b.type === 'bigchest' ? 1.4 : 1))[0];
     if (!chest) return null;
     const locked = chest.type === 'bigchest';
-    return {kind:locked?'bigchest':'chest',x:chest.x,y:chest.y,prop:chest,
+    const site=sites.get(chest);
+    return {kind:locked?'bigchest':'chest',x:chest.x,y:chest.y,prop:chest,site,
       radius:locked ? Math.max(46,(chest.r || 14) + p.r + 24) - 7 : Math.max((chest.r || 12) + p.r + 8,42),
-      label:locked ? '靠近並開啟鎖箱' : '靠近並攻擊寶箱'};
+      label:site.cover ? (locked ? '繞行寶箱 · 掩護開鎖' : '繞行寶箱 · 掩護攻擊') : locked ? '靠近並開啟鎖箱' : '靠近並攻擊寶箱'};
   }
   function objectiveWaypoint(p, goal, map) {
+    if (goal.site) {
+      const chest=goal.prop,site=goal.site,radial=distance(p,chest);
+      if(distance(p,site)<5) return site;
+      if(straightFree(p,site)) return site;
+      if(radial<site.ring*2.5) {
+        const from=Math.atan2(p.y-chest.y,p.x-chest.x),to=Math.atan2(site.y-chest.y,site.x-chest.x);
+        let best=null,cost=Infinity;
+        for(const sign of [-1,1]) {
+          const delta=((to-from)*sign+Math.PI*4)%(Math.PI*2);
+          const angle=from+sign*Math.min(0.35,delta);
+          const q={x:chest.x+Math.cos(angle)*site.ring,y:chest.y+Math.sin(angle)*site.ring};
+          if(!straightFree(p,q)) continue;
+          const value=delta*site.ring+distance(p,q);
+          if(value<cost){cost=value;best=q;}
+        }
+        if(best) return best;
+      }
+      goal={...goal,x:site.x,y:site.y,radius:5};
+    }
     if (distance(p,goal) <= goal.radius) return p;
     if (goal.kind === 'altar') {
       // Aim at the reachable edge of the solid altar, not its blocked grid cell.
@@ -1046,6 +1160,8 @@
   }
   function objectiveScore(p,q,dir,goal,waypoint) {
     const d=distance(q,goal), before=distance(p,goal);
+    if(goal.site) return (d<=goal.radius ? 105 : 0)
+      +(distance(p,waypoint)-distance(q,waypoint))*4-distance(q,goal.site)*0.25;
     if (d <= goal.radius) {
       // Stay inside the actual interaction radius for 3.5 s, without directly
       // opening a prop or forcing arena entry. Combat/hazard penalties still win.
@@ -1117,9 +1233,10 @@
       const bvx = s.vx || 0, bvy = s.vy || 0;
       const radius = p.r+(s.r ?? 6);
       const margin = 5+Math.min(9,Math.hypot(bvx,bvy)*0.015)+bodyCaution(p)*8;
+      const blocked=projectileBlockedAt(s,Math.min(remaining,plan.horizon));
       let closest = Infinity, entry = Infinity, actualEntry = Infinity;
       for (const seg of plan.segments) {
-        const duration = Math.min(seg.end,remaining)-seg.start;
+        const duration = Math.min(seg.end,remaining,blocked)-seg.start;
         if (duration <= 0) break;
         const rx = s.x+bvx*seg.start-seg.x, ry = s.y+bvy*seg.start-seg.y;
         const vx = bvx-seg.vx, vy = bvy-seg.vy, vv = vx*vx+vy*vy;
@@ -1242,6 +1359,8 @@
   }
   function steer(p, now) {
     // Replan at most 16 times/s; use analytic sweeps instead of tiny time steps.
+    projectileCoverCache.clear();
+    coverLifetimeCache.clear();
     const liveEnemies = game.EnemyMgr.all().filter(e => !e.dead && distance(e,p) < 1200);
     const enemies = liveEnemies.filter(e => (distance(e, p) < 560 || e.phase === 'dash')).sort((a, b) => distance(a, p) - distance(b, p));
     const map = buildTerrain(p, now);
@@ -1475,6 +1594,7 @@
     if (stopped) return false;
     const cached = game || findInterface();
     detachHooks(); game = null;
+    projectileCoverCache.clear();coverLifetimeCache.clear();chestSiteCache=new WeakMap();
     vector = [0, 0]; terrain = null; dodgeStop = null; objectiveScan = null; escapeState = ''; trail = []; turrets = []; seenCasts.clear(); held.clear();
     error = ''; manualUntil = 0; overSince = 0; lastThink = 0; lastStatus = 0;
     lastSwitch = -Infinity; switchCommitUntil = 0; tactic = ''; rotation = '';
