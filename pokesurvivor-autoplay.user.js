@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.13
+// @version      1.4.14
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.13';
+  const VERSION = '1.4.14';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -1060,8 +1060,7 @@
   function chestSafe(p, chest, map, enemies, shots, hazards, siteOverride = null) {
     if (p.hp < p.maxHp * (chest.type === 'altar' ? 0.2 : 0.35)) return false;
     const locked = chest.type === 'bigchest', d = distance(p, chest);
-    const radius = chest.type === 'altar' ? Math.max(30,(chest.r || 9)+p.r+14)-3
-      : locked ? Math.max(46, (chest.r || 14) + p.r + 24) - 7 : Math.max((chest.r || 12) + p.r + 8, 42);
+    const radius = chest.type === 'altar' || locked ? interactionRadii(p,chest).radius : Math.max((chest.r || 12) + p.r + 8, 42);
     const scale = d > radius ? (d - radius * 0.85) / d : 0;
     const site = siteOverride || {x:p.x + (chest.x-p.x)*scale,y:p.y + (chest.y-p.y)*scale};
     // Locked chests require 3.5 seconds of exposure. Check both the current
@@ -1092,17 +1091,30 @@
       && (chest.type === 'altar' || siteOverride ? altarExits(p,site,map) : terrainPosition(p,site,[0,0],enemies,null,map).safeExits) < 2) return false;
     return true;
   }
+  function interactionRadii(p, prop) {
+    const inner = (prop.r ?? (prop.type === 'altar' ? 9 : 14)) + p.r + 3;
+    const trigger = Math.max(prop.type === 'altar' ? 30 : 46,
+      (prop.r ?? (prop.type === 'altar' ? 9 : 14)) + p.r + (prop.type === 'altar' ? 14 : 24));
+    // Leave room on both sides: collision inside, strict native trigger outside.
+    const radius = trigger - 6;
+    return {inner,trigger,radius,ring:inner + (radius-inner)*0.45};
+  }
   function chestSite(p,chest,map,enemies,shots,hazards) {
     const now=performance.now(),cached=chestSiteCache.get(chest);
-    if(cached && now-cached.at<150 && distance(p,cached.origin)<32
+    const proximity = ['altar','bigchest'].includes(chest.type), bounds = interactionRadii(p,chest);
+    if(cached && ((now-cached.at<150 && distance(p,cached.origin)<32) || (proximity && distance(p,cached.site)<8))
+      && (!proximity || distance(cached.site,chest)<bounds.radius)
       && game.World.isFree(cached.site.x,cached.site.y,p.r,false)
       && chestSafe(p,chest,map,enemies,shots,hazards,cached.site)) return cached.site;
-    const inner=(chest.r || 12)+p.r+3;
-    const outer=chest.type==='bigchest' ? Math.max(46,(chest.r || 14)+p.r+24)-4 : Math.max(42,inner+8);
-    const radius=inner+(outer-inner)*0.65,base=Math.atan2(p.y-chest.y,p.x-chest.x);
+    const inner=proximity ? bounds.inner : (chest.r || 12)+p.r+3;
+    const outer=proximity ? bounds.radius : Math.max(42,inner+8);
+    const radius=proximity ? bounds.ring : inner+(outer-inner)*0.65,base=Math.atan2(p.y-chest.y,p.x-chest.x);
     let best=null,bestScore=-Infinity;
-    for(let i=0;i<16;i++) {
-      const angle=base+i*Math.PI/8,q={x:chest.x+Math.cos(angle)*radius,y:chest.y+Math.sin(angle)*radius};
+    // Deeper spots resist edge jitter; an outer safe ring remains available
+    // when cover is about to expire or another solid prop narrows the pocket.
+    const rings=proximity ? [radius,outer-1,inner+1] : [radius];
+    for(const ring of rings) for(let i=0;i<16;i++) {
+      const angle=base+i*Math.PI/8,q={x:chest.x+Math.cos(angle)*ring,y:chest.y+Math.sin(angle)*ring};
       if(!game.World.isFree(q.x,q.y,p.r,false) || !chestSafe(p,chest,map,enemies,shots,hazards,q)) continue;
       let cover=0;
       for(const e of enemies.filter(e=>e.behavior==='ranged' && distance(e,q)<600).slice(0,12)) {
@@ -1116,8 +1128,8 @@
           && projectileBlockedAt(s,t)<t) cover++;
       }
       const cost=propDetour(p,q,chest,inner);
-      const score=cover*35-cost*0.35;
-      if(score>bestScore) {best={...q,cover,ring:radius};bestScore=score;}
+      const score=cover*35-cost*0.35-Math.abs(ring-radius)*0.6;
+      if(score>bestScore) {best={...q,cover,ring};bestScore=score;}
     }
     if(best) chestSiteCache.set(chest,{at:now,origin:{x:p.x,y:p.y},site:best});
     return best;
@@ -1146,9 +1158,10 @@
         && o.hp !== 0 && Number.isInteger(o.kind) && o.kind >= 0 && o.kind < 4 && distance(p,o)<650)
         .sort((a,b)=>distance(p,a)-distance(p,b));
       for (const altar of altars) {
-        if (!chestSafe(p,altar,map,enemies,shots,hazards)) continue;
-        const goal = {kind:'altar',x:altar.x,y:altar.y,prop:altar,
-          radius:Math.max(30,(altar.r || 9)+p.r+14)-3,label:`使用祭壇 · ${labels[altar.kind]}`};
+        const site=chestSite(p,altar,map,enemies,shots,hazards);
+        if (!site) continue;
+        const goal = {kind:'altar',x:altar.x,y:altar.y,prop:altar,site,
+          radius:interactionRadii(p,altar).radius,label:`使用祭壇 · ${labels[altar.kind]}`};
         // A blocked altar must not pin navigation to a route with no progress.
         if (distance(p,goal)>goal.radius && distance(p,objectiveWaypoint(p,goal,map))<1) continue;
         return goal;
@@ -1170,7 +1183,7 @@
     const locked = chest.type === 'bigchest';
     const site=sites.get(chest);
     return {kind:locked?'bigchest':'chest',x:chest.x,y:chest.y,prop:chest,site,
-      radius:locked ? Math.max(46,(chest.r || 14) + p.r + 24) - 7 : Math.max((chest.r || 12) + p.r + 8,42),
+      radius:locked ? interactionRadii(p,chest).radius : Math.max((chest.r || 12) + p.r + 8,42),
       label:site.cover ? (locked ? '繞行寶箱 · 掩護開鎖' : '繞行寶箱 · 掩護攻擊') : locked ? '靠近並開啟鎖箱' : '靠近並攻擊寶箱'};
   }
   function objectiveWaypoint(p, goal, map) {
@@ -1263,7 +1276,9 @@
   function objectiveScore(p,q,dir,goal,waypoint) {
     const d=distance(q,goal), before=distance(p,goal);
     if(goal.site) return (d<=goal.radius ? 105 : 0)
-      +(distance(p,waypoint)-distance(q,waypoint))*4-distance(q,goal.site)*0.25;
+      +(distance(p,waypoint)-distance(q,waypoint))*4-distance(q,goal.site)*0.5
+      +(goal.kind==='bigchest' && d<=goal.radius && !dir[0] && !dir[1] ? 32 : 0)
+      -(before<=goal.radius && d>goal.radius ? 100 : 0);
     if (d <= goal.radius) {
       // Stay inside the actual interaction radius for 3.5 s, without directly
       // opening a prop or forcing arena entry. Combat/hazard penalties still win.
@@ -1513,6 +1528,7 @@
     if (target?.kind === 'heal' && p.hp < p.maxHp * 0.35) objective = null;
     if (objective) target = null;
     const waypoint = objective ? objectiveWaypoint(p, objective, map) : null;
+    const docking = objective?.site && ['altar','bigchest','chest'].includes(objective.kind);
     let stride = objective?.kind === 'altar'
       ? clamp((distance(p,objective)-((objective.prop.r || 9)+p.r+objective.radius)/2)/Math.max(1,speed*horizon),0.06,1)
       : objective ? clamp((distance(p,objective) - objective.radius * 0.7) / (speed * 0.65), 0.12, 1) : 1;
@@ -1530,12 +1546,16 @@
       const brake = i >= directions && !still && !route;
       const angle = route ? Math.atan2(waypoint.y-p.y,waypoint.x-p.x) : brake ? ((i-directions)%8)*Math.PI*2/8 : i*Math.PI*2/directions;
       // Near a chest, dodge at full speed rather than retaining opening stride.
-      const pace = dodge ? 1 : stride;
+      const dockPace = route && docking ? clamp(distance(p,waypoint)/Math.max(1,speed*0.2),0,1) : stride;
+      const pace = dodge ? 1 : dockPace;
       const dir = still ? [0, 0] : [Math.cos(angle) * pace, Math.sin(angle) * pace];
       const brakeAt = brake ? dodgeStop
         ? clamp(((dodgeStop.x-p.x)*dir[0]+(dodgeStop.y-p.y)*dir[1])/Math.max(1,speed),0.01,0.9)
         : [0.25,0.5,0.9][Math.floor((i-directions)/8)] : Infinity;
-      const plan = enteringRiftPlan(movementPlan(p,dir,speed,horizon,brakeAt),objective);
+      // Forecast braking at the precise waypoint instead of extrapolating
+      // through the solid prop; tiny corrections have no minimum stride.
+      const dockStop = route && docking && !dodge ? distance(p,waypoint)/Math.max(0.001,speed*pace) : Infinity;
+      const plan = enteringRiftPlan(movementPlan(p,dir,speed,horizon,Math.min(brakeAt,dockStop)),objective);
       if (plan.segments.some(seg=>!straightFree({x:seg.x,y:seg.y,r:p.r},
         {x:seg.x+seg.vx*(seg.end-seg.start),y:seg.y+seg.vy*(seg.end-seg.start)}))) continue;
       const danger = projectileDanger(p,plan,shots);
@@ -1555,7 +1575,8 @@
       }
       const q = plan.at(0.65);
       let ground = terrainPosition(p, q, dir, enemies, profile, map);
-      if (objective?.kind === 'altar' && distance(q,objective)<objective.radius+map.step) {
+      if ((objective?.kind === 'altar' || docking) && distance(q,objective)<objective.radius+map.step
+        && game.World.isFree(q.x,q.y,p.r,false)) {
         // Large players can reach the activation ring inside a coarse cell
         // marked solid by the altar's center. Verify real escape segments.
         const localExits = altarExits(p,q,map);
