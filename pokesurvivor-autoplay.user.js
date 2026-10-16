@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.11
-// @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，內建繁體中文，附穩定啟動與 GF 更新入口。
+// @version      1.4.12
+// @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
 // @updateURL    https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.meta.js
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.11';
+  const VERSION = '1.4.12';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -160,7 +160,7 @@
       : `等待遊戲初始化（${VERSION}）${elapsed}/30 秒 · ${detail}`;
   }
   const key = 'pokesurvivor-autoplay-v1';
-  let settings = { enabled: false, restart: false, collapsed: false, position: null };
+  let settings = { enabled: false, restart: false, chinese: true, background: true, collapsed: false, position: null };
   const restoreSettings = saved => {
     if (!saved || typeof saved !== 'object') return;
     for (const name of Object.keys(settings)) {
@@ -170,6 +170,7 @@
   try { restoreSettings(JSON.parse(localStorage.getItem(key) || '{}')); } catch (_) {}
   restoreSettings(carry?.settings);
   let localization = null;
+  let backgroundRunner = null;
   let game, originalAxis, originalOffer, hookedAxis, hookedOffer;
   let dodgeStop = null;
   let vector = [0, 0], offers = carry?.offers || [], offered = carry?.offered || null, lastChoice = 0;
@@ -209,7 +210,7 @@
     <div class="body"><div class="row"><span class="label">HP</span><span id="hp" class="hp-value">— / —</span></div><div class="hp-track"><div id="hp-fill" class="hp-fill"></div></div>
     <div class="row"><span class="label">招式輪替</span><span id="tactic">準備就緒</span></div><div class="slots">
     ${[0, 1, 2, 3].map(i => `<div id="slot-${i}" class="slot" data-active="false"><span class="slot-number">0${i + 1}</span><span id="move-${i}" class="slot-name">空槽</span><span id="cd-${i}" class="slot-cd">—</span><div id="bar-${i}" class="cd-track"></div></div>`).join('')}
-    </div><p id="rotation" class="rotation-note">等待目標</p><div class="actions"><button id="restart" aria-pressed="false">自動重開：關</button><button id="reload">↻ 重新載入 Bot</button></div><a id="stable" class="update-link" href="/guia/?poke-bot-launch=1" title="重新開啟穩定入口，先準備 Bot 再載入遊戲；目前本局會結束">穩定啟動 · 重開網頁</a><a id="update" class="update-link" href="${UPDATE_URL}" target="_blank" rel="noopener noreferrer" title="開啟 Greasy Fork 最新腳本，由 Userscripts 確認更新；更新後請重整遊戲以載入新版" aria-describedby="update-note">↑ 更新版本 · Greasy Fork ↗</a><p id="update-note" class="update-note">新分頁確認更新；套用新版需重整遊戲</p><p class="hint">觸控移動優先 · 重新載入保留本局</p></div>
+    </div><p id="rotation" class="rotation-note">等待目標</p><div class="actions"><button id="restart" aria-pressed="false">自動重開：關</button><button id="reload">↻ 重新載入 Bot</button><button id="chinese" aria-pressed="true" title="切換遊戲介面的繁體中文翻譯">中文翻譯：開</button><button id="background" aria-pressed="true" title="單人背景續跑；iPhone 切換 App、鎖屏或系統掛起後仍可能停止">背景續跑：開</button></div><p class="update-note">背景續跑受瀏覽器限制；多人背景維持原暫停機制</p><a id="stable" class="update-link" href="/guia/?poke-bot-launch=1" title="重新開啟穩定入口，先準備 Bot 再載入遊戲；目前本局會結束">穩定啟動 · 重開網頁</a><a id="update" class="update-link" href="${UPDATE_URL}" target="_blank" rel="noopener noreferrer" title="開啟 Greasy Fork 最新腳本，由 Userscripts 確認更新；更新後請重整遊戲以載入新版" aria-describedby="update-note">↑ 更新版本 · Greasy Fork ↗</a><p id="update-note" class="update-note">新分頁確認更新；套用新版需重整遊戲</p><p class="hint">觸控移動優先 · 重新載入保留本局</p></div>
   </div><button id="restore" hidden aria-label="展開 Bot 面板" title="點一下展開；拖曳可移動"><span class="ball" aria-hidden="true"></span><span class="mini-dot" aria-hidden="true"></span></button>`;
   const $ = id => shadow.getElementById(id);
   const persist = () => { try { localStorage.setItem(key, JSON.stringify(settings)); } catch (_) {} };
@@ -219,6 +220,11 @@
     $('toggle').setAttribute('aria-pressed', String(settings.enabled));
     renderRestart();
     renderReload();
+    $('chinese').textContent = `中文翻譯：${settings.chinese ? '開' : '關'}`;
+    $('chinese').setAttribute('aria-pressed', String(settings.chinese));
+    $('background').textContent = `背景續跑：${settings.background ? '開' : '關'}`;
+    $('background').setAttribute('aria-pressed', String(settings.background));
+    backgroundRunner?.sync();
     if ($('stable')) $('stable').hidden = !!game || controlledLaunch;
     root.setAttribute('data-running', String(settings.enabled));
     shadow.querySelector('.body').hidden = settings.collapsed;
@@ -232,6 +238,13 @@
   }
   $('toggle').onclick = () => { settings.enabled = !settings.enabled; vector = [0, 0]; error = ''; persist(); controls(); };
   $('restart').onclick = () => { if (multiplayer()) return; settings.restart = !settings.restart; overSince = 0; persist(); controls(); };
+  $('chinese').onclick = () => {
+    settings.chinese = !settings.chinese;
+    if (settings.chinese) { localization = installChinese(); localization?.refresh(game); }
+    else { localization?.destroy(); localization = null; }
+    persist(); controls(); renderPanel();
+  };
+  $('background').onclick = () => { settings.background = !settings.background; vector = [0,0]; persist(); controls(); };
   $('fold').onclick = () => { settings.collapsed = !settings.collapsed; persist(); controls(); };
   $('reload').onclick = () => {
     if (needsFreshPage()) {
@@ -334,7 +347,73 @@
     $('restart').setAttribute('aria-pressed', String(!multi && settings.restart));
   }
   function blocked() {
-    return document.hidden || visible('rotate') || held.size > 0 || performance.now() < manualUntil;
+    return (document.hidden && !backgroundAllowed()) || visible('rotate') || held.size > 0 || performance.now() < manualUntil;
+  }
+  function backgroundAllowed() { return settings.enabled && settings.background && !!game && !multiplayer(); }
+  function installBackgroundRunner() {
+    const originalRAF = window.requestAnimationFrame, originalCancel = window.cancelAnimationFrame;
+    if (typeof originalRAF !== 'function' || typeof originalCancel !== 'function') return null;
+    const pending = new Map();
+    let active = true, resumeTimer = null, frames = 0;
+    const running = () => active && document.hidden && backgroundAllowed();
+    function arm(record) {
+      if (!running() || record.timer != null || record.done) return;
+      record.timer = setTimeout(() => {
+        record.timer = null;
+        if (!running() || record.done) return;
+        frames++;
+        originalCancel.call(window,record.id);
+        tick();
+        deliver(record,performance.now());
+      }, 1000 / 30);
+    }
+    function deliver(record,ts) {
+      if (record.done) return;
+      record.done = true; pending.delete(record.id);
+      if (record.timer != null) clearTimeout(record.timer);
+      record.callback.call(window,ts);
+    }
+    const wrappedRAF = function(callback) {
+      const record = {callback,done:false,timer:null,id:null};
+      record.id = originalRAF.call(window,ts => deliver(record,ts));
+      pending.set(record.id,record); arm(record);
+      return record.id;
+    };
+    const wrappedCancel = function(id) {
+      const record = pending.get(id);
+      if (record) { record.done = true; if (record.timer != null) clearTimeout(record.timer); pending.delete(id); }
+      return originalCancel.call(window,id);
+    };
+    function sync() {
+      for (const record of pending.values()) {
+        if (running()) arm(record);
+        else if (record.timer != null) { clearTimeout(record.timer); record.timer = null; }
+      }
+    }
+    function onVisibility() {
+      if (resumeTimer != null) { clearTimeout(resumeTimer); resumeTimer = null; }
+      // Observe playing before the native listener auto-pauses. Resume only
+      // that transition, after all visibility listeners (including saves) ran.
+      const resume = running() && game.Game.state === 'playing' && !visible('rotate');
+      if (resume) resumeTimer = setTimeout(() => {
+        resumeTimer = null;
+        if (running() && !visible('rotate') && game.Game.state === 'paused') game.Game.togglePause?.();
+        if (running()) tick();
+      },0);
+      sync();
+    }
+    window.requestAnimationFrame = wrappedRAF;
+    window.cancelAnimationFrame = wrappedCancel;
+    addEventListener('visibilitychange',onVisibility,true);
+    return {sync, get frames() {return frames;}, destroy() {
+      active = false;
+      if (resumeTimer != null) clearTimeout(resumeTimer);
+      sync();
+      removeEventListener('visibilitychange',onVisibility,true);
+      if (window.requestAnimationFrame === wrappedRAF) window.requestAnimationFrame = originalRAF;
+      if (window.cancelAnimationFrame === wrappedCancel) window.cancelAnimationFrame = originalCancel;
+      // Leave pending native callbacks intact so removing Bot cannot stop Game.
+    }};
   }
   function install(g) {
     game = g;
@@ -1565,7 +1644,7 @@
       $('status').textContent = error ? `已停止：${error}` : !game ? initializationStatus(now)
         : now < reloadUntil ? 'Bot 已重新載入 · 本局繼續'
         : !settings.enabled ? '手動模式 · 點「自動：開」啟動'
-        : document.hidden ? '背景暫停' : visible('rotate') ? '請將 iPhone 轉成橫向'
+        : document.hidden ? (backgroundAllowed() ? '背景續跑中（受瀏覽器限制）' : '背景暫停') : visible('rotate') ? '請將 iPhone 轉成橫向'
         : held.size || now < manualUntil ? '手動接管中…' : game.Game.state === 'paused' ? '遊戲已暫停；請手動繼續'
         : multiplayer() && (game.Game.state === 'levelup' || visible('scr-levelup') || visible('scr-bond') || visible('scr-item')) ? '多人：請手動選牌／融合／道具'
         : multiplayer() && game.Game.state === 'over' ? '多人本局結束；請手動重開'
@@ -5251,6 +5330,8 @@
 };
   const exact = new Map(), lower = new Map(), fragments = new Map(), patterns = [];
   const cache = new Map(), translatedNodes = new WeakMap();
+  const originalTexts = new Map(), originalAttributes = new Map(), originalRoots = new Map();
+  let originalTitle = null;
   const literalCaptures = new Set([
     '¿Reportar la marca de {x} como trampa?', "Report {x}'s record as cheating?",
     '¿Banear a {x}? No podrán volver a salir en el ranking y se borra su marca.'
@@ -5316,7 +5397,10 @@
     if (translatedNodes.get(node) === before) return;
     const after = displayText(before, node.parentElement);
     translatedNodes.set(node, after);
-    if (after !== before) node.nodeValue = after;
+    if (after !== before) {
+      originalTexts.set(node,{before,after});
+      node.nodeValue = after;
+    }
   }
   function element(el) {
     if (skipped(el)) return;
@@ -5324,7 +5408,11 @@
       const before = el.getAttribute(attr);
       if (!before) continue;
       const after = displayText(before, el);
-      if (before !== after) el.setAttribute(attr, after);
+      if (before !== after) {
+        if (!originalAttributes.has(el)) originalAttributes.set(el,new Map());
+        originalAttributes.get(el).set(attr,{before,after});
+        el.setAttribute(attr, after);
+      }
     }
   }
   function walk(root) {
@@ -5344,11 +5432,17 @@
     style.textContent = 'html[data-poke-bot-zh] { --font: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", system-ui, sans-serif; } html[data-poke-bot-zh] .btn {letter-spacing:0} html[data-poke-bot-zh] .sub {line-height:1.55}';
     function maintain() {
       if (!active || !document.documentElement) return;
+      const html = document.documentElement;
+      if (!originalRoots.has(html)) originalRoots.set(html,{lang:html.getAttribute('lang'),marker:html.getAttribute('data-poke-bot-zh')});
+      // Do not retain discarded menus indefinitely in a long run.
+      for (const map of [originalTexts,originalAttributes,originalRoots]) {
+        for (const node of map.keys()) if (!node.isConnected) map.delete(node);
+      }
       if (!style.isConnected && document.head) document.head.appendChild(style);
       if (document.documentElement.lang !== 'zh-Hant') document.documentElement.lang = 'zh-Hant';
       if (document.documentElement.getAttribute('data-poke-bot-zh') !== VERSION) document.documentElement.setAttribute('data-poke-bot-zh',VERSION);
       const title = translate(document.title);
-      if (title !== document.title) document.title = title;
+      if (title !== document.title) { originalTitle = {before:document.title,after:title}; document.title = title; }
       const box = document.getElementById('login-mode');
       if (box && !document.getElementById('poke-bot-zh-note')) {
         const note = document.createElement('p'); note.id = 'poke-bot-zh-note'; note.dataset.pszhControl = '';
@@ -5406,15 +5500,28 @@
       judgment.drawOverlay = judgmentHook;
     }
     return {refresh, externalPatch, destroy() {
+      if (!active) return;
       active=false; observer.disconnect(); style.remove(); document.getElementById('poke-bot-zh-note')?.remove();
-      document.documentElement?.removeAttribute('data-poke-bot-zh');
+      for (const [node,{before,after}] of originalTexts) if (node.isConnected && node.nodeValue === after) node.nodeValue = before;
+      for (const [el,attrs] of originalAttributes) if (el.isConnected) {
+        for (const [attr,{before,after}] of attrs) if (el.getAttribute(attr) === after) el.setAttribute(attr,before);
+      }
+      if (originalTitle && document.title === originalTitle.after) document.title = originalTitle.before;
+      for (const [html,original] of originalRoots) if (html.isConnected) {
+        if (html.lang === 'zh-Hant') { if (original.lang == null) html.removeAttribute('lang'); else html.setAttribute('lang',original.lang); }
+        if (html.getAttribute('data-poke-bot-zh') === VERSION) {
+          if (original.marker == null) html.removeAttribute('data-poke-bot-zh'); else html.setAttribute('data-poke-bot-zh',original.marker);
+        }
+      }
+      originalTexts.clear(); originalAttributes.clear(); originalRoots.clear();
       for (const restore of restorers) restore();
       if (boundGame?.Judgment.drawOverlay === judgmentHook) boundGame.Judgment.drawOverlay = originalJudgment;
       if (window[sharedMarker] === owner) delete window[sharedMarker];
     }};
   }
 
-  localization = installChinese();
+  localization = settings.chinese ? installChinese() : null;
+  backgroundRunner = installBackgroundRunner();
   controls();
   const timer = setInterval(tick, 60);
   tick();
@@ -5424,7 +5531,7 @@
     get diagnostics() {
       const candidate = game || capturedGame || window.G || captureCandidates[0];
       return {version:VERSION, connected:!!game, elapsedSeconds:Math.floor((performance.now()-startedAt)/1000),controlledLaunch,launchState,
-        chinese:!!localization, externalChinesePatch:!!localization?.externalPatch, injectionState, documentState:document.readyState || 'unknown', missing:missingInterface(candidate), captureIssue, error};
+        chinese:!!localization, externalChinesePatch:!!localization?.externalPatch, background:settings.background, backgroundFrames:backgroundRunner?.frames || 0, injectionState, documentState:document.readyState || 'unknown', missing:missingInterface(candidate), captureIssue, error};
     },
     reload: reloadBot,
     handoff() {
@@ -5438,7 +5545,7 @@
       window.visualViewport?.removeEventListener('resize',onPanelResize);
       window.visualViewport?.removeEventListener('scroll',onPanelResize);
       stopped = true; clearInterval(timer); releaseCapture(); capturedGame = null; captureCandidates.length = 0; vector = [0, 0]; root.remove();
-      detachHooks(); localization?.destroy();
+      detachHooks(); localization?.destroy(); backgroundRunner?.destroy();
       removeEventListener('keydown', onDown); removeEventListener('keyup', onUp); removeEventListener('blur', onBlur);
       if (window.PokeSurvivorBot === api) delete window.PokeSurvivorBot;
     }
