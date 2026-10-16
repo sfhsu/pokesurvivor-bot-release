@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.12
+// @version      1.4.13
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.12';
+  const VERSION = '1.4.13';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -498,21 +498,26 @@
       ? (m.stat === 'regen' ? 22 : m.stat === 'atk' ? 20 : 12)
       : moveValue(m, slot.filter(other => other !== m))), 0);
   }
-  function fusionValue(slot) {
-    const attacks = slot.filter(damaging).length;
+  function fusionValue(slot, available = []) {
+    const attackMoves = slot.filter(damaging), attacks = attackMoves.length;
     const stats = new Set(slot.filter(m => m.kind === 'buff').map(m => m.stat));
-    // Establish two attacks, preferring a projectile plus ground residue.
-    // A third attack never earns the pair bonus or displaces a useful buff.
-    const buffs = stats.has('atk') * 10000 + stats.has('spd') * 1000 + stats.has('def') * 100;
-    return Math.min(2, attacks) * 1000000 + kitePairRank(slot) * 25000 + buffs
+    // Keep one damage anchor, then fuse active buffs before a second attack.
+    // Reserve two attack places: a third buff must not consume the last one.
+    const excessBuffs = Math.max(0,slot.filter(m => m.kind === 'buff').length - 2);
+    const buffs = stats.has('atk') * 100000 + stats.has('spd') * 10000 + stats.has('def') * 1000;
+    // Look ahead to a still-loose kite partner while choosing the damage
+    // anchor, so early buff fusion does not lock out projectile + residue.
+    const pair = attacks === 1 ? Math.max(0,...available.filter(m => !slot.includes(m)).map(m => kitePairRank([attackMoves[0],m]))) : kitePairRank(slot);
+    return (attacks > 0 ? 1000000 : 0) + (attacks >= 2 ? 200 : 0)
+      + pair * 250 + buffs - excessBuffs * 2000000
       + Math.min(99, slotValue(slot) / 10);
   }
   function fusionChoiceValue(group, m, candidates, firstPick) {
-    if (!firstPick) return fusionValue([...group,m]);
+    if (!firstPick) return fusionValue([...group,m],candidates);
     // The first card anchors a two-step pair. Evaluate its best legal partner
     // rather than rewarding an isolated buff which cannot deal damage.
     const partners = candidates.filter(other => other !== m);
-    return Math.max(...partners.map(other => fusionValue([m,other])),0)
+    return Math.max(...partners.map(other => fusionValue([m,other],candidates)),0)
       + (damaging(m) ? 0.1 + moveValue(m) / 10000 : 0);
   }
   function mainSlot(p) {
