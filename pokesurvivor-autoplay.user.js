@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.14
+// @version      1.4.15
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.14';
+  const VERSION = '1.4.15';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -445,6 +445,7 @@
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
   const learned = p => p.moves || p.slots.flat();
   const damaging = m => m && m.kind !== 'buff';
+  const buffRank = m => m?.kind === 'buff' ? ({atk:4,spd:3,def:2,regen:1})[m.stat] || 0 : 0;
   const control = m => !!(m.slow || m.burn || m.poison);
   // Trails tick repeatedly; mines persist until triggered, then burst once.
   // Status effects, falling meteors and shooting turrets are not ground residue.
@@ -537,20 +538,19 @@
     if (c.type === 'up') {
       // Develop learned moves before expanding the roster, including rotation slots.
       if (!m) return 130;
+      if (buffRank(m)) return 195 + buffRank(m) + Math.min(8,m.lvl || 1) * 0.1;
       return 130 + (inMain ? 15 : 0) + Math.min(8, m.lvl || 1) * 3 + (m.kind === 'buff' ? -5 : 0);
     }
     if (c.type === 'new') {
       if (!m) return 30;
       if (m.kind === 'buff') {
-        const stats = new Set(main.filter(move => move.kind === 'buff').map(move => move.stat));
-        const attacks = moves.filter(damaging).length;
-        const room = p.bonds > 0 && main.length < 4 && main.some(damaging);
-        if (!room || stats.has(m.stat) || attacks < 2) return 12;
-        // Keep learned-move upgrades above new acquisitions, while collecting
-        // the missing buff needed by the planned two-attack fusion.
-        return ({atk:124,spd:122,def:121})[m.stat] || 35;
+        const buffs = moves.filter(move => move.kind === 'buff');
+        // Collect useful active boosts even before fusion is available.
+        // Two distinct buffs leave the intended two attack places available.
+        if (!moves.some(damaging) || buffs.some(move => move.stat === m.stat) || buffs.length >= 2) return 12;
+        return buffRank(m) ? 190 + buffRank(m) : 35;
       }
-      // Fill the missing kite role before redundant attacks or new buffs,
+      // Fill the missing kite role before redundant attacks,
       // below every learned upgrade. Stop once both roles are owned or the
       // main fusion already has two attacks; do not add a third core attack.
       const missingGround = groundRank(m) && moves.some(move => move.kind === 'projectile') && !moves.some(groundRank);
@@ -771,6 +771,15 @@
     if (switching && slot.every(m => m.kind === 'turret') && slot.every(m => turrets.some(t => t.move === m && t.until > performance.now() + 1000))) score *= 0.25;
     return score;
   }
+  function buffCastPriority(p,slot,switching) {
+    return Math.max(0,...(slot || []).map(m => {
+      if (!buffRank(m)) return 0;
+      const b=p.buffs?.[m.stat];
+      const delay=entryDelay(m,switching);
+      const refresh=Math.max(1.5,delay+0.25);
+      return delay<0.4 && (!b || b.n<(m.stacks || 1) || b.t<refresh) ? buffRank(m) : 0;
+    }));
+  }
   function selectSlot(p, enemies, now) {
     rotation = '等待目標';
     if (!p.setActive || !enemies.length) return;
@@ -780,17 +789,19 @@
     const ready = current.some(m => damaging(m) && hitEstimate(p, m, current, enemies) > 0 && entryDelay(m, false) <= 0.12);
     rotation = ready ? '持續輸出' : '評估冷卻輪替';
     if (now - lastSwitch < 240 || now < switchCommitUntil) return;
-    let best = p.active, bestValue = currentValue;
+    const currentPriority = enemies.some(e => e.kind !== 'chest') ? buffCastPriority(p,current,false) : 0;
+    let best = p.active, bestValue = currentValue, bestPriority = currentPriority;
     p.slots.forEach((slot, i) => {
       if (i === p.active) return;
       const value = rotationValue(p, slot, enemies, true);
-      if (value > bestValue) { best = i; bestValue = value; }
+      const priority = enemies.some(e => e.kind !== 'chest') ? buffCastPriority(p,slot,true) : 0;
+      if (priority > bestPriority || (priority === bestPriority && value > bestValue)) { best = i; bestValue = value; bestPriority = priority; }
     });
     // Never swap away from a useful attack that is about to fire for a tiny gain.
     const margin = Math.max(ready ? 5 : 1.5, currentValue * (ready ? 0.25 : 0.06));
-    if (best !== p.active && bestValue > currentValue + margin) {
+    if (best !== p.active && (bestPriority > currentPriority || (bestPriority === currentPriority && bestValue > currentValue + margin))) {
       const selected = p.slots[best];
-      const delays = selected.filter(m => damaging(m) && hitEstimate(p, m, selected, enemies) > 0).map(m => entryDelay(m, true));
+      const delays = selected.filter(m => (bestPriority > 0 && buffRank(m)) || (damaging(m) && hitEstimate(p, m, selected, enemies) > 0)).map(m => entryDelay(m, true));
       p.setActive(best);
       if (p.active === best) {
         lastSwitch = now;
