@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.16
+// @version      1.4.17
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.16';
+  const VERSION = '1.4.17';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -175,6 +175,7 @@
   let dodgeStop = null;
   let vector = [0, 0], offers = carry?.offers || [], offered = carry?.offered || null, lastChoice = 0;
   let rerollState = carry?.rerollState || {player:null,level:null,attempts:0,offers:null};
+  let damagePlan = {known:false,insufficient:false}, damageHistory = [], damagePlayer = null;
   let manualUntil = 0, overSince = 0, lastThink = 0, lastStatus = 0;
   let originalBond, hookedBond, bondChoice = carry?.bondChoice || null;
   let turrets = [], seenCasts = new Map();
@@ -500,12 +501,94 @@
       ? (m.stat === 'regen' ? 22 : m.stat === 'atk' ? 20 : 12)
       : moveValue(m, slot.filter(other => other !== m))), 0);
   }
+  // A conservative damage model for build decisions, not measured combat DPS.
+  function moveDamageRate(m) {
+    if (!damaging(m)) return 0;
+    const count=Math.min(3,1+Math.max(0,(m.count || 1)-1)*0.5);
+    const period=m.kind === 'trail' ? 0.5 : m.kind === 'turret' ? (m.rate || 0.6)
+      : m.kind === 'orbit' ? 0.5 : Math.max(0.05,m.cd || 1);
+    return Math.max(0,m.dmg || 0)*count/period*(m.kind === 'dash' || m.kind === 'melee' ? 0.7 : 1);
+  }
+  function slotDamageRate(p,slot,castBuff=false) {
+    let value=slot.reduce((sum,m)=>sum+moveDamageRate(m)
+      /(['trail','turret','orbit'].includes(m.kind) ? 1 : Math.max(0.05,p.cdMul || 1)),0)*Math.max(0.01,p.atk || 1);
+    // Credit one real attack-buff cast, rather than assuming five free stacks.
+    if (castBuff) for (const m of slot.filter(m=>m.kind === 'buff' && m.stat === 'atk')) {
+      const b=p.buffs?.atk, factor=1+(b?.n || 0)*(b?.amount || 0);
+      if ((b?.n || 0)<(m.stacks || 1)) value*=1+(m.amount || 0)/factor;
+    }
+    return value;
+  }
+  function updateDamagePlan(p) {
+    const t=game.Game.st?.time;
+    if (damagePlayer !== p || !Number.isFinite(t) || t < (damageHistory.at(-1)?.t || 0)) {
+      damagePlayer=p;damageHistory=[];damagePlan={known:false,insufficient:false};
+    }
+    if (!Number.isFinite(t) || t<0) return;
+    const foes=(game.EnemyMgr.all() || []).filter(e=>!e.dead && !e.boss && e.hp>0 && distance(p,e)<600);
+    const tiers=game.Enemies?.TIERS || [];
+    let phase=-1;tiers.forEach((tier,i)=>{if(t>=tier.from)phase=i;});
+    const tier=tiers[phase];
+    const hp=foes.map(e=>e.maxHp || e.hp).sort((a,b)=>a-b);
+    const stageHp=tier ? tier.hp*(game.Enemies.scale?.(t)?.hp || (1+t/95))*(3.3+Math.min(1.7,t/210)) : 0;
+    const enemyHp=Math.max(stageHp*0.6,hp.length ? hp[Math.floor(hp.length/2)] : stageHp);
+    if (!(enemyHp>0)) {damagePlan={known:false,insufficient:false};return;}
+    if (Number.isFinite(p.dmgDealt) && game.Game.state === 'playing') {
+      if (p.dmgDealt<(damageHistory.at(-1)?.damage || 0)) damageHistory=[];
+      if (!damageHistory.length || t-damageHistory.at(-1).t>=0.5) damageHistory.push({t,damage:p.dmgDealt});
+      while(damageHistory.length>1 && t-damageHistory[0].t>6)damageHistory.shift();
+    }
+    const first=damageHistory[0], span=first ? t-first.t : 0;
+    const observed=span>=4 && Number.isFinite(p.dmgDealt) ? Math.max(0,(p.dmgDealt-first.damage)/span) : null;
+    const required=enemyHp/clamp(3.5-Math.max(0,phase)*0.2,2,3.5);
+    const modeled=Math.max(0,...p.slots.map(slot=>slotDamageRate(p,slot)));
+    const ratio=modeled/required, crowded=foes.length>=8 && observed!==null && observed<required*0.9;
+    let insufficient=damagePlan.insufficient;
+    if (!insufficient && (ratio<0.85 || crowded)) insufficient=true;
+    else if (insufficient && ratio>=1.15 && !crowded && t-(damagePlan.changedAt || 0)>=3) insufficient=false;
+    const changedAt=insufficient!==damagePlan.insufficient ? t : damagePlan.changedAt || 0;
+    damagePlan={known:true,insufficient,phase:phase+1,time:t,modeled,required,observed,ratio,crowded,changedAt};
+  }
+  function immediateDamageGain(c,p) {
+    const moves=learned(p),id=c.key.split(':')[1],m=moves.find(m=>m.id===id) || game.Moves.BY_ID[id];
+    const baseline=Math.max(0,...p.slots.map(slot=>slotDamageRate(p,slot)));
+    if (c.key === 'stat:atk') return baseline*0.1;
+    if (c.key === 'stat:cd') return Math.max(0,...p.slots.map(slot=>slotDamageRate({atk:p.atk || 1,cdMul:(p.cdMul || 1)*0.92},slot)))-baseline;
+    if (!m) return 0;
+    if (m.kind === 'buff') {
+      if (m.stat !== 'atk') return 0;
+      const b=p.buffs?.atk, factor=1+(b?.n || 0)*(b?.amount || 0);
+      if(c.type === 'new') {
+        if(moves.some(other=>other.kind==='buff' && other.stat==='atk') || moves.filter(m=>m.kind==='buff').length>=2)return 0;
+        return baseline*(m.amount || 0)/factor;
+      }
+      if(c.type === 'up' && game.Moves.levelUp) {
+        const copy={...m};game.Moves.levelUp(copy);
+        return baseline*Math.max(0,(copy.amount || 0)-(m.amount || 0))*Math.max(1,b?.n || 0)/factor;
+      }
+      return 0;
+    }
+    if(c.type === 'new') {
+      const extra=slotDamageRate(p,[m]);
+      // Ground residue can continue hurting while another slot attacks.
+      return Math.max(0,extra-baseline,groundRank(m) && !moves.some(groundRank) ? extra*0.25 : 0);
+    }
+    if(c.type !== 'up' && c.type !== 'evo')return 0;
+    const copy={...m};
+    if(c.type === 'up')game.Moves.levelUp?.(copy);else game.Moves.evolve?.(copy);
+    const after=Math.max(0,...p.slots.map(slot=>slotDamageRate(p,slot.map(other=>other===m?copy:other))));
+    return Math.max(0,after-baseline);
+  }
   function fusionValue(slot, available = []) {
     const attackMoves = slot.filter(damaging), attacks = attackMoves.length;
     const stats = new Set(slot.filter(m => m.kind === 'buff').map(m => m.stat));
     // Keep one damage anchor, then fuse active buffs before a second attack.
     // Reserve two attack places: a third buff must not consume the last one.
     const excessBuffs = Math.max(0,slot.filter(m => m.kind === 'buff').length - 2);
+    if (damagePlan.insufficient && (excessBuffs || attacks>2)) return -1e12;
+    if (damagePlan.insufficient) return (attacks>0 ? 1000000 : 0)
+      + slotDamageRate(game.Game.player,slot,true)*10000 + kitePairRank(slot)*10
+      + (stats.has('atk')*4+stats.has('spd')*3+stats.has('def')*2+stats.has('regen'))*0.1;
     const buffs = stats.has('atk') * 100000 + stats.has('spd') * 10000 + stats.has('def') * 1000;
     // Look ahead to a still-loose kite partner while choosing the damage
     // anchor, so early buff fusion does not lock out projectile + residue.
@@ -533,7 +616,11 @@
     const inMain = main.some(move => move.id === id);
     if (c.key === 'stat:heal') return hp < 0.4 ? 220 : hp < 0.7 ? 95 : -10;
     if (c.key === 'stat:hp') {
-      if (hp < 0.5) return 190;
+      if (hp < 0.5) return damagePlan.insufficient ? 215 : 190;
+    }
+    if (damagePlan.insufficient) {
+      const gain=immediateDamageGain(c,p);
+      if(gain>0) return 200+12*gain/(Math.max(1,damagePlan.modeled)+gain);
     }
     if (c.type === 'evo') return inMain ? 180 : 170;
     if (c.type === 'up') {
@@ -753,6 +840,8 @@
         const needsStack = !buff || buff.n < (m.stacks || 1) || buff.t < 1.5;
         if (needsStack && entryDelay(m, switching) < 0.4) {
           // Buff-only slots get a brief turn, then yield to actual damage.
+          if(damagePlan.insufficient && m.stat === 'atk')
+            score += (damagePlan.modeled || 0)*(m.amount || 0)*3/(1+(buff?.n || 0)*(buff?.amount || 0));
           score += m.stat === 'regen' && p.hp < p.maxHp * 0.7 ? 18 : m.stat === 'atk' ? 10 : 3;
         }
         continue;
@@ -774,7 +863,7 @@
   }
   function buffCastPriority(p,slot,switching) {
     return Math.max(0,...(slot || []).map(m => {
-      if (!buffRank(m)) return 0;
+      if (!buffRank(m) || damagePlan.insufficient) return 0;
       const b=p.buffs?.[m.stat];
       const delay=entryDelay(m,switching);
       const refresh=Math.max(1.5,delay+0.25);
@@ -857,6 +946,7 @@
   }
   function buildCard(c,p) {
     const score=cardScore(c,p);
+    if(damagePlan.insufficient) return immediateDamageGain(c,p)>0 || (c.type==='stat' && score>=119) || (c.type==='evo');
     if (c.type === 'up' || c.type === 'evo' || score >= 124) return true;
     // Evolution prerequisites and escaping a melee-only start are useful now.
     if (c.type === 'stat' && score >= 119) return true;
@@ -876,7 +966,7 @@
     // Never discard an immediately useful card, especially emergency healing.
     if (offers.some(c => buildCard(c,p) || (c.key === 'stat:heal' && p.hp/p.maxHp < 0.4))) return false;
     const moves=learned(p);
-    let possible=moves.some(m => game.Moves.nextUpText?.(m));
+    let possible=moves.some(m => game.Moves.nextUpText?.(m) && buildCard({type:'up',key:'up:'+m.id},p));
     if (!possible && p.slots.length < (p.maxMoves || 4) && p.mon?.types && game.Moves.poolFor) {
       possible=game.Moves.poolFor(p.mon).some(id => !moves.some(m => m.id === id) && !p.banned?.has(id)
         && buildCard({type:'new',key:'new:'+id},p));
@@ -1688,7 +1778,7 @@
         if (p !== previousPlayer) { previousPlayer = p; lastSwitch = -Infinity; switchCommitUntil = 0; tactic = ''; terrain = null; dodgeStop = null; objectiveScan = null; trail = []; turrets = []; seenCasts.clear(); vector = [0, 0]; overSince = 0; }
         if (!settings.enabled || blocked()) { vector = [0, 0]; dodgeStop = null; }
         else {
-          if (p) choose(p, now);
+          if (p) {updateDamagePlan(p);choose(p, now);}
           if (p && !p.dead && game.Game.state === 'playing' && now - lastThink >= 60) {
             lastThink = now; steer(p, now);
           }
@@ -1739,7 +1829,7 @@
     const p = game?.Game.player;
     $('hp').textContent = p ? `${Math.ceil(p.hp)} / ${Math.ceil(p.maxHp)}` : '— / —';
     $('hp-fill').style.width = `${p ? clamp(p.hp / p.maxHp * 100, 0, 100) : 0}%`;
-    $('tactic').textContent = tactic || '準備就緒';
+    $('tactic').textContent = [tactic || '準備就緒',damagePlan.known ? `${damagePlan.phase ? '階段 '+damagePlan.phase+' · ' : ''}${damagePlan.insufficient ? '補強輸出優先' : '輸出足夠 · 強化優先'}` : ''].filter(Boolean).join(' / ');
     for (let i = 0; i < 4; i++) {
       const slot = p?.slots?.[i] || [];
       $('slot-' + i).setAttribute('data-active', String(!!slot.length && i === p.active));
@@ -5602,7 +5692,7 @@
     get diagnostics() {
       const candidate = game || capturedGame || window.G || captureCandidates[0];
       return {version:VERSION, connected:!!game, elapsedSeconds:Math.floor((performance.now()-startedAt)/1000),controlledLaunch,launchState,
-        chinese:!!localization, externalChinesePatch:!!localization?.externalPatch, background:settings.background, backgroundFrames:backgroundRunner?.frames || 0, injectionState, documentState:document.readyState || 'unknown', missing:missingInterface(candidate), captureIssue, error};
+        chinese:!!localization, externalChinesePatch:!!localization?.externalPatch, background:settings.background, backgroundFrames:backgroundRunner?.frames || 0, injectionState, damage:{...damagePlan}, documentState:document.readyState || 'unknown', missing:missingInterface(candidate), captureIssue, error};
     },
     reload: reloadBot,
     handoff() {
