@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.9
+// @version      1.4.10
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，內建繁體中文，附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.9';
+  const VERSION = '1.4.10';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -401,6 +401,8 @@
     value += m.evolved ? 24 : 0;
     if (m.hex && companions.some(control)) value += 18;
     if (control(m) && companions.some(other => other.hex)) value += 12;
+    // Prefer other attacks when learning or fusing; Substitute remains usable.
+    if (m.id === 'substitute') value -= 25;
     return value;
   }
   function slotValue(slot) {
