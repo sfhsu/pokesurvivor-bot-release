@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.15
+// @version      1.4.16
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.15';
+  const VERSION = '1.4.16';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -174,6 +174,7 @@
   let game, originalAxis, originalOffer, hookedAxis, hookedOffer;
   let dodgeStop = null;
   let vector = [0, 0], offers = carry?.offers || [], offered = carry?.offered || null, lastChoice = 0;
+  let rerollState = carry?.rerollState || {player:null,level:null,attempts:0,offers:null};
   let manualUntil = 0, overSince = 0, lastThink = 0, lastStatus = 0;
   let originalBond, hookedBond, bondChoice = carry?.bondChoice || null;
   let turrets = [], seenCasts = new Map();
@@ -854,6 +855,38 @@
     }
     return score;
   }
+  function buildCard(c,p) {
+    const score=cardScore(c,p);
+    if (c.type === 'up' || c.type === 'evo' || score >= 124) return true;
+    // Evolution prerequisites and escaping a melee-only start are useful now.
+    if (c.type === 'stat' && score >= 119) return true;
+    const m=game.Moves.BY_ID[c.key.split(':')[1]], main=mainSlot(p).filter(damaging);
+    return c.type === 'new' && m && main.length > 0
+      && main.every(move => ['melee','dash','mine','trail'].includes(move.kind))
+      && ['projectile','beam','chain','meteor','turret'].includes(m.kind) && score >= 90;
+  }
+  function rerollEarly(p,now) {
+    if (!Number.isFinite(p.level) || p.level > 15 || p.level < 1) return false;
+    if (rerollState.player !== p || rerollState.level !== p.level)
+      rerollState={player:p,level:p.level,attempts:0,offers:null};
+    const button=document.getElementById('lvl-reroll');
+    const left=Math.max(0,1+(p.rerollBonus || 0)-(p.rerolls || 0));
+    if (!left || rerollState.attempts >= 2 || rerollState.offers === offers
+      || !visible('lvl-reroll') || button.disabled || typeof button.click !== 'function') return false;
+    // Never discard an immediately useful card, especially emergency healing.
+    if (offers.some(c => buildCard(c,p) || (c.key === 'stat:heal' && p.hp/p.maxHp < 0.4))) return false;
+    const moves=learned(p);
+    let possible=moves.some(m => game.Moves.nextUpText?.(m));
+    if (!possible && p.slots.length < (p.maxMoves || 4) && p.mon?.types && game.Moves.poolFor) {
+      possible=game.Moves.poolFor(p.mon).some(id => !moves.some(m => m.id === id) && !p.banned?.has(id)
+        && buildCard({type:'new',key:'new:'+id},p));
+    }
+    if (!possible) return false; // Do not chase maxed, banned or unavailable moves.
+    rerollState.attempts++; rerollState.offers=offers;
+    lastChoice=now; tactic='早期重抽 · 尋找核心招式';
+    button.click(); // Native UI alone consumes the legitimate per-run allowance.
+    return true; // The native handler replaces both offers and card elements.
+  }
   function choose(p, now) {
     if (multiplayer()) return; // All upgrade, fusion and item choices stay manual in a room.
     if (now - lastChoice < 650) return;
@@ -863,6 +896,7 @@
       let index = 0;
       if (offers.length === cards.length) {
         if (offered === offers) return;
+        if (rerollEarly(p,now)) return;
         for (let i = 1; i < offers.length; i++) if (cardScore(offers[i], p) > cardScore(offers[index], p)) index = i;
         offered = offers;
       }
@@ -5572,7 +5606,7 @@
     },
     reload: reloadBot,
     handoff() {
-      const state = { game: game || capturedGame, offers, offered, bondChoice, settings: { ...settings } };
+      const state = { game: game || capturedGame, offers, offered, bondChoice, rerollState, settings: { ...settings } };
       api.destroy();
       return state;
     },
