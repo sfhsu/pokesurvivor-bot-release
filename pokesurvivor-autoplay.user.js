@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.20
+// @version      1.4.21
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.20';
+  const VERSION = '1.4.21';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -456,7 +456,9 @@
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
   const learned = p => p.moves || p.slots.flat();
   const damaging = m => m && m.kind !== 'buff';
-  const buffRank = m => m?.kind === 'buff' ? ({atk:4,spd:3,def:2,regen:1})[m.stat] || 0 : 0;
+  const poisonBuild = p => !!p && learned(p).some(m => damaging(m) && m.poison > 0);
+  const buffRank = m => m?.kind === 'buff' ? (poisonBuild(game.Game.player)
+    ? {def:4,regen:3,spd:2,atk:1} : {atk:4,spd:3,def:2,regen:1})[m.stat] || 0 : 0;
   const control = m => !!(m.slow || m.burn || m.poison);
   // Trails tick repeatedly; mines persist until triggered, then burst once.
   // Status effects, falling meteors and shooting turrets are not ground residue.
@@ -609,6 +611,8 @@
   function buildStep(p) {
     if(completedCore(p)) return p.slots.length<(p.maxMoves || 4)?'fill':'passive';
     const moves=learned(p),attacks=moves.filter(damaging);
+    if(poisonBuild(p)) return !moves.some(m=>m.kind==='buff' && m.stat==='def') ? 'defense'
+      : !moves.some(m=>m.kind==='buff' && m.stat==='regen') ? 'recovery' : 'upgrade';
     const defense=moves.some(m=>m.kind==='buff' && m.stat==='def');
     const attackBuff=moves.some(m=>m.kind==='buff' && m.stat==='atk');
     if (!attacks.length) return 'attack';
@@ -627,6 +631,11 @@
     // Normal: damage anchor, defense, second attack, attack buff.
     // Fast clears combine attacks first; reserve two places for attacks.
     const excessBuffs = Math.max(0,slot.filter(m => m.kind === 'buff').length - 2);
+    if(poisonBuild(game.Game.player)) return (slot.some(m=>damaging(m) && m.poison>0)?10000000:0)
+      + stats.has('def')*1000000 + stats.has('regen')*100000
+      + (attacks>=2?10000:0) + kitePairRank(slot)*250
+      + stats.has('atk')*1000 + stats.has('spd')*100
+      - (excessBuffs+Math.max(0,attacks-2))*20000000 + Math.min(99,slotValue(slot)/10);
     if (damagePlan.insufficient && (excessBuffs || attacks>2)) return -1e12;
     if (damagePlan.insufficient) return (attacks>0 ? 1000000 : 0)
       + slotDamageRate(game.Game.player,slot,true)*10000 + kitePairRank(slot)*10
@@ -656,11 +665,26 @@
     const id = c.key.split(':')[1];
     const m = moves.find(move => move.id === id) || game.Moves.BY_ID[id];
     const inMain = main.some(move => move.id === id);
-    if (c.key === 'stat:atk') return 250;
     if (c.key === 'stat:heal') return hp < 0.4 ? 300 : hp < 0.7 ? 95 : -10;
-    if (c.key === 'stat:hp') {
-      if (hp < 0.5) return completedCore(p) ? 245 : damagePlan.insufficient ? 215 : 190;
+    // Flat recovery must keep pace with max-HP true damage. Never let the
+    // damage-deficit or completed-core heuristics override survival stats.
+    if (c.key === 'stat:def') return (p.dmgReduce || 0)>=0.7 ? -30 : 280;
+    if (c.key === 'stat:rgn') return 270;
+    if (c.key === 'stat:hp') return 5;
+    if (c.type==='new' && m?.poison>0 && !poisonBuild(p)) return 260;
+    if(poisonBuild(p)) {
+      if(c.key==='stat:atk') return 35;
+      if(m?.kind==='buff' && ['def','regen'].includes(m.stat)) {
+        const rank=m.stat==='def'?2:1;
+        if(c.type==='up' || c.type==='evo') return 240+rank;
+        if(c.type==='new' && moves.filter(m=>m.kind==='buff').length<2
+          && !moves.some(other=>other.kind==='buff' && other.stat===m.stat)) return 250+rank;
+      }
+      if(m?.poison>0 && (c.type==='up' || c.type==='evo')) return 230;
+      if(c.type==='up' || c.type==='evo') return 30;
+      if(c.key==='stat:cd') return 45;
     }
+    if (c.key === 'stat:atk') return 250;
     const core=completedCore(p);
     if(core) {
       const full=p.slots.length>=(p.maxMoves || 4);
@@ -671,22 +695,19 @@
         return 230+Math.min(4,moveValue(m,core)/25);
       }
       if(full && c.type==='stat') {
-        if(id==='def')return p.hp/p.maxHp<0.5?205:210;
-        if(id==='hp')return p.hp/p.maxHp<0.5?220:205;
         if(id==='cd')return 185;
-        if(id==='rgn')return hp<0.7?190:175;
       }
       if(c.type==='up' && !core.some(other=>other.id===id)) return 70;
     }
-    if (damagePlan.insufficient) {
+    if (damagePlan.insufficient && !poisonBuild(p)) {
       const gain=immediateDamageGain(c,p);
       if(gain>0) return 200+12*gain/(Math.max(1,damagePlan.modeled)+gain);
     }
-    if(c.type==='new' && m && !damagePlan.insufficient) {
+    if(c.type==='new' && m && (!damagePlan.insufficient || poisonBuild(p))) {
       const step=buildStep(p), buffs=moves.filter(m=>m.kind==='buff');
       if(m.kind==='buff' && buffs.length<2 && !buffs.some(other=>other.stat===m.stat)) {
         if(m.stat==='def') return step==='defense'?225:fastClear() && step==='fuse'?125:205;
-        if(m.stat==='atk') return step==='swords'?215:step==='fuse'?45:185;
+        if(m.stat==='atk') return poisonBuild(p)?40:step==='swords'?215:step==='fuse'?45:185;
         // Save the two planned buff places for Harden and Swords Dance.
         return 45;
       }
@@ -935,9 +956,14 @@
     if (switching && slot.every(m => m.kind === 'turret') && slot.every(m => turrets.some(t => t.move === m && t.until > performance.now() + 1000))) score *= 0.25;
     return score;
   }
-  function buffCastPriority(p,slot,switching) {
+  function buffCastPriority(p,slot,switching,enemies=[]) {
     return Math.max(0,...(slot || []).map(m => {
-      if (!buffRank(m) || damagePlan.insufficient) return 0;
+      // Percentage-HP poison is not represented by the direct damage model.
+      // Reapply before expiry and build real stacks, then let other attacks fire.
+      if(m.poison>0 && entryDelay(m,switching)<0.4
+        && enemies.some(e=>e.kind!=='chest' && e.hp>0 && ((e.poison || 0)<8 || e.poisonT<1.5)
+          && hitEstimate(p,m,slot,[e])>0)) return 1.5;
+      if (!buffRank(m) || (damagePlan.insufficient && !poisonBuild(p))) return 0;
       const b=p.buffs?.[m.stat];
       const delay=entryDelay(m,switching);
       const refresh=Math.max(1.5,delay+0.25);
@@ -953,12 +979,12 @@
     const ready = current.some(m => damaging(m) && hitEstimate(p, m, current, enemies) > 0 && entryDelay(m, false) <= 0.12);
     rotation = ready ? '持續輸出' : '評估冷卻輪替';
     if (now - lastSwitch < 240 || now < switchCommitUntil) return;
-    const currentPriority = enemies.some(e => e.kind !== 'chest') ? buffCastPriority(p,current,false) : 0;
+    const currentPriority = enemies.some(e => e.kind !== 'chest') ? buffCastPriority(p,current,false,enemies) : 0;
     let best = p.active, bestValue = currentValue, bestPriority = currentPriority;
     p.slots.forEach((slot, i) => {
       if (i === p.active) return;
       const value = rotationValue(p, slot, enemies, true);
-      const priority = enemies.some(e => e.kind !== 'chest') ? buffCastPriority(p,slot,true) : 0;
+      const priority = enemies.some(e => e.kind !== 'chest') ? buffCastPriority(p,slot,true,enemies) : 0;
       if (priority > bestPriority || (priority === bestPriority && value > bestValue)) { best = i; bestValue = value; bestPriority = priority; }
     });
     // Never swap away from a useful attack that is about to fire for a tiny gain.
@@ -1020,7 +1046,11 @@
   }
   function buildCard(c,p) {
     const score=cardScore(c,p);
-    if(c.key==='stat:def' || c.key==='stat:hp' || c.key==='stat:atk') return true;
+    if(c.key==='stat:def') return score>0;
+    if(c.key==='stat:rgn') return true;
+    if(c.key==='stat:hp') return false;
+    if(c.key==='stat:atk' && !poisonBuild(p)) return true;
+    if(poisonBuild(p)) return score>=119;
     if(damagePlan.insufficient) return immediateDamageGain(c,p)>0 || (c.type==='stat' && score>=119) || (c.type==='evo');
     if (c.type === 'up' || c.type === 'evo' || score >= 124) return true;
     // Evolution prerequisites and escaping a melee-only start are useful now.
@@ -1906,7 +1936,7 @@
     const p = game?.Game.player;
     $('hp').textContent = p ? `${Math.ceil(p.hp)} / ${Math.ceil(p.maxHp)}` : '— / —';
     $('hp-fill').style.width = `${p ? clamp(p.hp / p.maxHp * 100, 0, 100) : 0}%`;
-    $('tactic').textContent = [tactic || '準備就緒',p && completedCore(p) ? (p.slots.length<(p.maxMoves || 4)?'主技完成 · 補滿招式槽':'滿槽 · 能力成長') : '',damagePlan.known ? `${damagePlan.phase ? '階段 '+damagePlan.phase+' · ' : ''}${damagePlan.insufficient ? '補強輸出優先' : '輸出足夠 · 強化優先'}` : ''].filter(Boolean).join(' / ');
+    $('tactic').textContent = [tactic || '準備就緒',p && completedCore(p) ? (p.slots.length<(p.maxMoves || 4)?'主技完成 · 補滿招式槽':'滿槽 · 能力成長') : '',poisonBuild(p) ? '毒傷生存 · 減傷＞回血 · 控制血量' : damagePlan.known ? `${damagePlan.phase ? '階段 '+damagePlan.phase+' · ' : ''}${damagePlan.insufficient ? '補強輸出優先' : '輸出足夠 · 強化優先'}` : ''].filter(Boolean).join(' / ');
     for (let i = 0; i < 4; i++) {
       const slot = p?.slots?.[i] || [];
       $('slot-' + i).setAttribute('data-active', String(!!slot.length && i === p.active));
