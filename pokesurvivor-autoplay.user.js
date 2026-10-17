@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.19
+// @version      1.4.20
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.19';
+  const VERSION = '1.4.20';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -160,7 +160,7 @@
       : `等待遊戲初始化（${VERSION}）${elapsed}/30 秒 · ${detail}`;
   }
   const key = 'pokesurvivor-autoplay-v1';
-  let settings = { enabled: false, restart: false, chinese: true, background: true, collapsed: false, position: null };
+  let settings = { enabled: false, restart: false, manualPoints: false, chinese: true, background: true, collapsed: false, position: null };
   const restoreSettings = saved => {
     if (!saved || typeof saved !== 'object') return;
     for (const name of Object.keys(settings)) {
@@ -213,7 +213,7 @@
     <div class="body"><div class="row"><span class="label">HP</span><span id="hp" class="hp-value">— / —</span></div><div class="hp-track"><div id="hp-fill" class="hp-fill"></div></div>
     <div class="row"><span class="label">招式輪替</span><span id="tactic">準備就緒</span></div><div class="slots">
     ${[0, 1, 2, 3].map(i => `<div id="slot-${i}" class="slot" data-active="false"><span class="slot-number">0${i + 1}</span><span id="move-${i}" class="slot-name">空槽</span><span id="cd-${i}" class="slot-cd">—</span><div id="bar-${i}" class="cd-track"></div></div>`).join('')}
-    </div><p id="rotation" class="rotation-note">等待目標</p><div class="actions"><button id="restart" aria-pressed="false">自動重開：關</button><button id="reload">↻ 重新載入 Bot</button><button id="chinese" aria-pressed="true" title="切換遊戲介面的繁體中文翻譯">中文翻譯：開</button><button id="background" aria-pressed="true" title="單人背景續跑；iPhone 切換 App、鎖屏或系統掛起後仍可能停止">背景續跑：開</button></div><p class="update-note">背景續跑受瀏覽器限制；多人背景維持原暫停機制</p><a id="stable" class="update-link" href="/guia/?poke-bot-launch=1" title="重新開啟穩定入口，先準備 Bot 再載入遊戲；目前本局會結束">穩定啟動 · 重開網頁</a><a id="update" class="update-link" href="${UPDATE_URL}" target="_blank" rel="noopener noreferrer" title="開啟 Greasy Fork 最新腳本，由 Userscripts 確認更新；更新後請重整遊戲以載入新版" aria-describedby="update-note">↑ 更新版本 · Greasy Fork ↗</a><p id="update-note" class="update-note">新分頁確認更新；套用新版需重整遊戲</p><p class="hint">觸控移動優先 · 重新載入保留本局</p></div>
+    </div><p id="rotation" class="rotation-note">等待目標</p><div class="actions"><button id="restart" aria-pressed="false">自動重開：關</button><button id="manual-points" aria-pressed="false" title="單人手動選牌、重抽、融合與道具；自動走位和戰鬥繼續">手動加點：關</button><button id="reload">↻ 重新載入 Bot</button><button id="chinese" aria-pressed="true" title="切換遊戲介面的繁體中文翻譯">中文翻譯：開</button><button id="background" aria-pressed="true" title="單人背景續跑；iPhone 切換 App、鎖屏或系統掛起後仍可能停止">背景續跑：開</button></div><p class="update-note">背景續跑受瀏覽器限制；多人背景維持原暫停機制</p><a id="stable" class="update-link" href="/guia/?poke-bot-launch=1" title="重新開啟穩定入口，先準備 Bot 再載入遊戲；目前本局會結束">穩定啟動 · 重開網頁</a><a id="update" class="update-link" href="${UPDATE_URL}" target="_blank" rel="noopener noreferrer" title="開啟 Greasy Fork 最新腳本，由 Userscripts 確認更新；更新後請重整遊戲以載入新版" aria-describedby="update-note">↑ 更新版本 · Greasy Fork ↗</a><p id="update-note" class="update-note">新分頁確認更新；套用新版需重整遊戲</p><p class="hint">觸控移動優先 · 重新載入保留本局</p></div>
   </div><button id="restore" hidden aria-label="展開 Bot 面板" title="點一下展開；拖曳可移動"><span class="ball" aria-hidden="true"></span><span class="mini-dot" aria-hidden="true"></span></button>`;
   const $ = id => shadow.getElementById(id);
   const persist = () => { try { localStorage.setItem(key, JSON.stringify(settings)); } catch (_) {} };
@@ -222,6 +222,7 @@
     $('toggle').textContent = `自動：${settings.enabled ? '開' : '關'}`;
     $('toggle').setAttribute('aria-pressed', String(settings.enabled));
     renderRestart();
+    renderManualPoints();
     renderReload();
     $('chinese').textContent = `中文翻譯：${settings.chinese ? '開' : '關'}`;
     $('chinese').setAttribute('aria-pressed', String(settings.chinese));
@@ -241,6 +242,7 @@
   }
   $('toggle').onclick = () => { settings.enabled = !settings.enabled; vector = [0, 0]; error = ''; persist(); controls(); };
   $('restart').onclick = () => { if (multiplayer()) return; settings.restart = !settings.restart; overSince = 0; persist(); controls(); };
+  $('manual-points').onclick = () => { if(multiplayer()) return; settings.manualPoints=!settings.manualPoints; persist(); controls(); };
   $('chinese').onclick = () => {
     settings.chinese = !settings.chinese;
     if (settings.chinese) { localization = installChinese(); localization?.refresh(game); }
@@ -343,6 +345,12 @@
     return el && !el.classList.contains('hidden') && el.getClientRects().length > 0;
   };
   function multiplayer() { return !!(game?.Coop?.active || game?.Social?.room); }
+  function renderManualPoints() {
+    const multi=multiplayer(),button=$('manual-points');
+    button.disabled=multi;
+    button.textContent=multi?'多人：手動加點':`手動加點：${settings.manualPoints?'開':'關'}`;
+    button.setAttribute('aria-pressed',String(multi || settings.manualPoints));
+  }
   function renderRestart() {
     const multi = multiplayer();
     $('restart').disabled = multi;
@@ -593,7 +601,7 @@
     if(typeof originalBondOptions!=='function') return;
     const nativeOptions=originalBondOptions;
     hookedBondOptions=function(...args) {
-      if(settings.enabled && !multiplayer() && completedCore(this)) return null;
+      if(settings.enabled && !settings.manualPoints && !multiplayer() && completedCore(this)) return null;
       return nativeOptions.apply(this,args);
     };
     p.bondOptions=hookedBondOptions;
@@ -1045,7 +1053,7 @@
     return true; // The native handler replaces both offers and card elements.
   }
   function choose(p, now) {
-    if (multiplayer()) return; // All upgrade, fusion and item choices stay manual in a room.
+    if (multiplayer() || settings.manualPoints) return; // Leave every choice and reroll to the player.
     if (now - lastChoice < 650) return;
     if (game.Game.state === 'levelup' && visible('scr-levelup')) {
       const cards = [...document.querySelectorAll('#cards .card')];
@@ -1875,6 +1883,7 @@
         : document.hidden ? (backgroundAllowed() ? '背景續跑中（受瀏覽器限制）' : '背景暫停') : visible('rotate') ? '請將 iPhone 轉成橫向'
         : held.size || now < manualUntil ? '手動接管中…' : game.Game.state === 'paused' ? '遊戲已暫停；請手動繼續'
         : multiplayer() && (game.Game.state === 'levelup' || visible('scr-levelup') || visible('scr-bond') || visible('scr-item')) ? '多人：請手動選牌／融合／道具'
+        : settings.manualPoints && (game.Game.state === 'levelup' || visible('scr-levelup') || visible('scr-bond') || visible('scr-item')) ? '單人：請手動選牌／重抽／融合／道具'
         : multiplayer() && game.Game.state === 'over' ? '多人本局結束；請手動重開'
         : game.Game.state === 'over' ? (settings.restart ? '結算後 5 秒重開' : '本局結束')
         : multiplayer() ? (game.Game.state === 'playing' ? `多人自動：${tactic || '走位'} · 升級手動` : '多人房間：等待手動開局')
@@ -1891,6 +1900,7 @@
   }
   function renderPanel() {
     renderRestart();
+    renderManualPoints();
     renderReload();
     if ($('stable')) $('stable').hidden = !!game || controlledLaunch;
     const p = game?.Game.player;
@@ -5761,7 +5771,7 @@
     get diagnostics() {
       const candidate = game || capturedGame || window.G || captureCandidates[0];
       return {version:VERSION, connected:!!game, elapsedSeconds:Math.floor((performance.now()-startedAt)/1000),controlledLaunch,launchState,
-        chinese:!!localization, externalChinesePatch:!!localization?.externalPatch, background:settings.background, backgroundFrames:backgroundRunner?.frames || 0, injectionState, damage:{...damagePlan,fastClear:fastClear(),buildStep:game?.Game.player ? buildStep(game.Game.player) : null}, documentState:document.readyState || 'unknown', missing:missingInterface(candidate), captureIssue, error};
+        manualPoints:settings.manualPoints, chinese:!!localization, externalChinesePatch:!!localization?.externalPatch, background:settings.background, backgroundFrames:backgroundRunner?.frames || 0, injectionState, damage:{...damagePlan,fastClear:fastClear(),buildStep:game?.Game.player ? buildStep(game.Game.player) : null}, documentState:document.readyState || 'unknown', missing:missingInterface(candidate), captureIssue, error};
     },
     reload: reloadBot,
     handoff() {
