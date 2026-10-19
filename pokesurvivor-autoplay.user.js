@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.21
+// @version      1.4.22
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.21';
+  const VERSION = '1.4.22';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -179,6 +179,7 @@
   let manualUntil = 0, overSince = 0, lastThink = 0, lastStatus = 0;
   let bondPlayer = null, originalBondOptions, hookedBondOptions;
   let originalBond, hookedBond, bondChoice = carry?.bondChoice || null;
+  let originalItem, hookedItem, itemChoice = carry?.itemChoice || null;
   let turrets = [], seenCasts = new Map();
   let terrain = null, escapeState = '', objectiveScan = null;
   let projectileCoverCache = new Map();
@@ -444,6 +445,17 @@
       return list;
     };
     g.LevelUp.offer = hookedOffer;
+    if(typeof g.RunUI.showItemChoice==='function') {
+      originalItem=g.RunUI.showItemChoice;
+      hookedItem=function(cur,next,cb,...args) {
+        const choice=itemChoice={ids:[cur,next]};
+        return originalItem.call(this,cur,next,function(...values) {
+          if(itemChoice===choice)itemChoice=null;
+          return cb.apply(this,values);
+        },...args);
+      };
+      g.RunUI.showItemChoice=hookedItem;
+    }
     if (typeof g.RunUI.showBond === 'function') {
       originalBond = g.RunUI.showBond;
       hookedBond = function (opt, ...args) {
@@ -456,9 +468,10 @@
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
   const learned = p => p.moves || p.slots.flat();
   const damaging = m => m && m.kind !== 'buff';
+  const buffStat = m => ['patk','satk'].includes(m?.stat) ? 'atk' : m?.stat;
   const poisonBuild = p => !!p && learned(p).some(m => damaging(m) && m.poison > 0);
   const buffRank = m => m?.kind === 'buff' ? (poisonBuild(game.Game.player)
-    ? {def:4,regen:3,spd:2,atk:1} : {atk:4,spd:3,def:2,regen:1})[m.stat] || 0 : 0;
+    ? {def:4,regen:3,spd:2,atk:1} : {atk:4,spd:3,def:2,regen:1})[buffStat(m)] || 0 : 0;
   const control = m => !!(m.slow || m.burn || m.poison);
   // Trails tick repeatedly; mines persist until triggered, then burst once.
   // Status effects, falling meteors and shooting turrets are not ground residue.
@@ -614,7 +627,7 @@
     if(poisonBuild(p)) return !moves.some(m=>m.kind==='buff' && m.stat==='def') ? 'defense'
       : !moves.some(m=>m.kind==='buff' && m.stat==='regen') ? 'recovery' : 'upgrade';
     const defense=moves.some(m=>m.kind==='buff' && m.stat==='def');
-    const attackBuff=moves.some(m=>m.kind==='buff' && m.stat==='atk');
+    const attackBuff=moves.some(m=>m.kind==='buff' && buffStat(m)==='atk');
     if (!attacks.length) return 'attack';
     if (fastClear()) {
       if(attacks.length<2) return 'second';
@@ -627,7 +640,7 @@
   }
   function fusionValue(slot, available = []) {
     const attackMoves = slot.filter(damaging), attacks = attackMoves.length;
-    const stats = new Set(slot.filter(m => m.kind === 'buff').map(m => m.stat));
+    const stats = new Set(slot.filter(m => m.kind === 'buff').map(buffStat));
     // Normal: damage anchor, defense, second attack, attack buff.
     // Fast clears combine attacks first; reserve two places for attacks.
     const excessBuffs = Math.max(0,slot.filter(m => m.kind === 'buff').length - 2);
@@ -707,7 +720,7 @@
       const step=buildStep(p), buffs=moves.filter(m=>m.kind==='buff');
       if(m.kind==='buff' && buffs.length<2 && !buffs.some(other=>other.stat===m.stat)) {
         if(m.stat==='def') return step==='defense'?225:fastClear() && step==='fuse'?125:205;
-        if(m.stat==='atk') return poisonBuild(p)?40:step==='swords'?215:step==='fuse'?45:185;
+        if(buffStat(m)==='atk') return poisonBuild(p)?40:step==='swords'?215:step==='fuse'?45:185;
         // Save the two planned buff places for Harden and Swords Dance.
         return 45;
       }
@@ -1082,12 +1095,27 @@
     button.click(); // Native UI alone consumes the legitimate per-run allowance.
     return true; // The native handler replaces both offers and card elements.
   }
+  function itemValue(id,p) {
+    if(id==='choiceband') return -1000; // Never choose a move-locking item.
+    if(id==='lifeorb') return -100; // Repeated self-damage undermines recovery.
+    if(id==='leftovers') return 100;
+    if(id==='assaultvest') {
+      const base=(p.dmgReduce || 0)-(p.item==='assaultvest'?0.2:0)
+        +(p.buffs?.def?.n || 0)*(p.buffs?.def?.amount || 0);
+      return base>=0.8?20:90+Math.min(1,(0.8-base)/0.2)*5;
+    }
+    if(id==='focussash') return !Number.isFinite(p.sashT) || performance.now()-p.sashT>60000 ? 85 : 55;
+    return ({shellbell:80,choicescarf:65,quickclaw:40,rockyhelmet:30,luckyegg:15,amuletcoin:10})[id] ?? 0;
+  }
   function choose(p, now) {
     if (multiplayer() || settings.manualPoints) return; // Leave every choice and reroll to the player.
     if (now - lastChoice < 650) return;
     if (game.Game.state === 'levelup' && visible('scr-levelup')) {
       const cards = [...document.querySelectorAll('#cards .card')];
-      if (!cards.length || document.getElementById('cards').classList.contains('done')) return;
+      const box=document.getElementById('cards');
+      // Native RunUI ignores early clicks while its 600 ms input guard is
+      // active. Do not mark an ignored click as an applied upgrade.
+      if (!cards.length || box.classList.contains('done') || box.classList.contains('guard')) return;
       let index = 0;
       if (offers.length === cards.length) {
         if (offered === offers) return;
@@ -1097,10 +1125,17 @@
       }
       lastChoice = now; cards[index].click();
     } else if (visible('scr-item')) {
+      if(document.getElementById('item-cards')?.classList.contains('guard')) return;
       const cards = [...document.querySelectorAll('#item-cards .card')];
-      const card = cards[0];
+      const ids=itemChoice?.ids;
+      let index=0;
+      if(ids?.length===cards.length)for(let i=1;i<ids.length;i++) {
+        if(itemValue(ids[i],p)>itemValue(ids[index],p))index=i;
+      }
+      const card = cards[index];
       if (card) { lastChoice = now; card.click(); }
     } else if (visible('scr-bond')) {
+      if(document.getElementById('bond-cards')?.classList.contains('guard')) return;
       const cards = [...document.querySelectorAll('#bond-cards .card')];
       let index = 0, candidates = [];
       if (bondChoice) {
@@ -1956,6 +1991,7 @@
     if (game?.Input.axis === hookedAxis) game.Input.axis = originalAxis;
     if (game?.LevelUp.offer === hookedOffer) game.LevelUp.offer = originalOffer;
     if (hookedBond && game?.RunUI.showBond === hookedBond) game.RunUI.showBond = originalBond;
+    if (hookedItem && game?.RunUI.showItemChoice === hookedItem) game.RunUI.showItemChoice = originalItem;
   }
   function reloadBot() {
     if (stopped) return false;
@@ -2189,7 +2225,7 @@
   "Dentellada rápida que hace retroceder.": "快速咬擊，擊退敵人。",
   "Descarga rapidísima que atraviesa varios enemigos.": "極快的電流，可貫穿多個敵人。",
   "Destello a tu alrededor.": "在周圍釋放閃光。",
-  "Drena vida de todo lo cercano y te cura con cada golpe.": "吸取附近敵人的生命，每次命中都能回復體力。",
+  "Drena vida de todo lo cercano y te cura con cada golpe.": "吸取附近敵人的體力，每次命中都能回復體力。",
   "Raíces que atrapan y machacan todo lo que tienes cerca.": "用根部困住並重擊附近的敵人。",
   "Embiste en arco a todo lo que tengas delante.": "向前方弧形範圍衝撞。",
   "Esfera de energía que nunca falla.": "必定命中的能量球。",
@@ -4285,7 +4321,7 @@
   "A quick bite that knocks foes back.": "快速咬擊，擊退敵人。",
   "A lightning-fast bolt that pierces several enemies.": "極快的電流，可貫穿多個敵人。",
   "A flash of light all around you.": "在周圍釋放閃光。",
-  "Drains life from everything nearby and heals you with every hit.": "吸取附近敵人的生命，每次命中都能回復體力。",
+  "Drains life from everything nearby and heals you with every hit.": "吸取附近敵人的體力，每次命中都能回復體力。",
   "Roots that snare and pound everything near you.": "用根部困住並重擊附近的敵人。",
   "Charges in an arc at everything in front of you.": "向前方弧形範圍衝撞。",
   "An energy sphere that never misses.": "必定命中的能量球。",
@@ -5018,7 +5054,7 @@
   "Nickname": "暱稱",
   "It's unique and can't be changed.": "暱稱不可重複，且無法變更。",
   "Account type": "帳號類型",
-  "Save": "存檔",
+  "Save": "儲存",
   "This browser's account": "此瀏覽器的帳號",
   "Name and password": "名稱與密碼",
   "Delete account": "刪除帳號",
@@ -5215,7 +5251,7 @@
   "Buscar por nombre": "依名稱搜尋",
   "Wild Pokémon are getting stronger and stronger!": "野生寶可夢正變得越來越強！",
   "· Duplicates give PokéCoins. Shinies never repeat.": "· 重複的寶可夢會轉換成寶可幣；閃光寶可夢不會重複。",
-  "· Tickets are earned by playing: some Pokémon drop them when defeated, and bosses and rift legendaries sometimes give ×10 tickets.": "· 遊玩即可獲得抽獎券：部分寶可夢被擊敗時會掉落，頭目和裂縫中的傳說寶可夢有時會掉落十連抽獎券。",
+  "· Tickets are earned by playing: some Pokémon drop them when defeated, and bosses and rift legendaries sometimes give ×10 tickets.": "· 遊玩即可獲得抽獎券：部分寶可夢被擊敗時會掉落，首領和裂隙中的傳說寶可夢有時會掉落十連抽獎券。",
   "Paused: {x} is choosing…": "已暫停：{x} 正在選擇…",
   "Paused: {x} are choosing…": "已暫停：{x} 正在選擇…",
   "The game crashed: your run has been saved up to this point": "遊戲發生錯誤：已儲存本局截至目前的進度",
@@ -5322,7 +5358,7 @@
   "Press Space to skip": "按空白鍵跳過",
   "Run from Arceus! It is invincible": "快逃離阿爾宙斯！牠無法被擊敗",
   "{x} answers the Judgment!": "{x} 應審判之召現身！",
-  "JUDGMENT · {x} · BOSSES {x}": "審判 · {x} · 頭目 {x}",
+  "JUDGMENT · {x} · BOSSES {x}": "審判 · {x} · 首領 {x}",
   "Against Arceus": "對抗阿爾宙斯",
   "{x} · {x} legendaries": "{x} · {x} 隻傳說寶可夢",
   "{x} · {x} legendary": "{x} · {x} 隻傳說寶可夢",
@@ -5442,7 +5478,7 @@
   "Open menu": "開啟選單",
   "Close menu": "關閉選單",
   "· Los repetidos dan Pokémonedas. Los shiny no se repiten.": "· 重複的寶可夢會轉換成寶可幣；閃光寶可夢不會重複。",
-  "· Los tickets se consiguen jugando: algunos Pokémon los sueltan al caer, y los jefes y los legendarios de las grietas, a veces, tickets ×10.": "· 遊玩即可獲得抽獎券：部分寶可夢被擊敗時會掉落，頭目和裂縫中的傳說寶可夢有時會掉落十連抽獎券。",
+  "· Los tickets se consiguen jugando: algunos Pokémon los sueltan al caer, y los jefes y los legendarios de las grietas, a veces, tickets ×10.": "· 遊玩即可獲得抽獎券：部分寶可夢被擊敗時會掉落，首領和裂隙中的傳說寶可夢有時會掉落十連抽獎券。",
   "Pausa: {x} está eligiendo…": "已暫停：{x} 正在選擇…",
   "Pausa: {x} están eligiendo…": "已暫停：{x} 正在選擇…",
   "El juego ha fallado: tu partida se ha guardado hasta aquí": "遊戲發生錯誤：已儲存本局截至目前的進度",
@@ -5474,7 +5510,7 @@
   "Pulsa Espacio para saltar": "按空白鍵跳過",
   "¡Huye de Arceus! Es invencible": "快逃離阿爾宙斯！牠無法被擊敗",
   "¡{x} acude a la Sentencia!": "{x} 應審判之召現身！",
-  "SENTENCIA · {x} · JEFES {x}": "審判 · {x} · 頭目 {x}",
+  "SENTENCIA · {x} · JEFES {x}": "審判 · {x} · 首領 {x}",
   "Ante Arceus": "對抗阿爾宙斯",
   "{x} · {x} legendarios": "{x} · {x} 隻傳說寶可夢",
   "{x} · {x} legendario": "{x} · {x} 隻傳說寶可夢",
@@ -5502,7 +5538,7 @@
   "Si juegas con nombre y contraseña, puedes vincular tu Gmail: si un día olvidas la contraseña, entras con Google y es tu misma cuenta. Te lo ofrecemos al entrar.": "使用名稱和密碼登入的玩家，可以連結 Gmail；之後若忘記密碼，使用 Google 登入就能回到同一個帳號。登入時會出現連結提示。",
   "Las tablas de la semana y del mes del ranking empiezan de cero, como el histórico: ahora sólo cuentan partidas con la Sentencia de Arceus y todas las tablas cuadran entre sí.": "每週與每月排行榜和總排行榜一樣重新開始計算，現在只計入採用阿爾宙斯審判機制的遊戲紀錄，讓各排行榜的計算標準一致。",
   "Cooperativo: la partida ya no se queda parada con cada uno esperando a que el otro elija. Un objeto y las cartas de nivel ya no se tapan, y si la conexión pierde un aviso se arregla solo.": "合作模式：修正玩家互相等待對方選擇，導致遊戲停住的問題。道具與升級卡片不再互相遮擋；連線若漏傳訊息，也能自動恢復。",
-  "Cooperativo: al volver de una grieta, quien no era el anfitrión ya ve a todos los enemigos (antes algunos eran invisibles y sólo se veían sus ataques).": "合作模式：從裂縫返回後，非房主玩家也能正常看見所有敵人；先前部分敵人會隱形，只看得到牠們的攻擊。",
+  "Cooperativo: al volver de una grieta, quien no era el anfitrión ya ve a todos los enemigos (antes algunos eran invisibles y sólo se veían sus ataques).": "合作模式：從裂隙返回後，非房主玩家也能正常看見所有敵人；先前部分敵人會隱形，只看得到牠們的攻擊。",
   "Amigos: si tu móvil u ordenador tiene la hora (o la zona horaria) mal puesta, tus amigos ya no salen siempre desconectados y sus invitaciones te llegan.": "好友功能：即使手機或電腦的時間、時區設定不正確，好友也不會一直顯示為離線，並能正常收到好友邀請。",
   "14 October 2026": "2026 年 10 月 14 日",
   "14 de octubre de 2026": "2026 年 10 月 14 日",
@@ -5513,13 +5549,13 @@
   "Botón para reportar marcas sospechosas en el ranking (la banderita de cada fila).": "排行榜新增可疑紀錄檢舉按鈕（每列的小旗子）。",
   "El ranking histórico empieza de cero: ahora que las partidas acaban ante Arceus, las marcas de antes ya no se podrían alcanzar. Las tablas de hoy, de la semana y del mes siguen igual.": "歷史排行榜重新開始：現在戰局會在對抗阿爾宙斯的階段結束，舊紀錄已無法再達成，因此重置歷史榜。每日、每週與每月排行榜保持不變。",
   "Se quita el tiempo extra del minuto 60 (ya no se llega hasta ahí).": "移除第 60 分鐘起的延長戰局機制，因為現在已無法存活到那個階段。",
-  "Desde el minuto 28 ya no se abren grietas, para que la Sentencia no te pille dentro de una.": "從第 28 分鐘起不再開啟裂縫，避免審判開始時玩家仍在裂縫中。",
+  "Desde el minuto 28 ya no se abren grietas, para que la Sentencia no te pille dentro de una.": "從第 28 分鐘起不再開啟裂隙，避免審判開始時玩家仍在裂隙中。",
   "Ranking protegido contra trampas: el servidor comprueba que cada marca se ha jugado de verdad. Nunca se pierde nada de lo que ganas jugando.": "排行榜新增反作弊保護：伺服器會確認每筆成績都來自實際遊玩，但不會因此扣除你遊玩獲得的獎勵。",
   "Se han quitado del ranking las marcas de más de 35 minutos: con la Sentencia de Arceus ya no son posibles.": "已移除排行榜中超過 35 分鐘的紀錄；在阿爾宙斯的審判機制下，這些成績已不可能達成。",
   "Las tiradas del gacha, los Pokémon nuevos y los premios se guardan en la nube al momento. Si abriste el juego en otro aparato o navegador y te faltaba algo, vuelve a abrirlo donde lo conseguiste: se recupera solo.": "扭蛋結果、新獲得的寶可夢和獎勵，現在都會立即儲存至雲端。若在其他裝置或瀏覽器開啟遊戲時發現內容缺少，請回到原本獲得它們的裝置或瀏覽器重新開啟遊戲，就會自動恢復。",
   "13 October 2026": "2026 年 10 月 13 日",
   "13 de octubre de 2026": "2026 年 10 月 13 日",
-  "Tiempo extra y grietas con menos azar": "延長戰局與裂縫出現機制調整",
+  "Tiempo extra y grietas con menos azar": "延長戰局與裂隙出現機制調整",
   "Tiempo extra: desde el minuto 60 los Pokémon salvajes se vuelven cada vez más fuertes (más vida y más daño), y cada vez más deprisa. Antes, con las mejoras al máximo, algunas partidas no acababan nunca; ahora las mejores rondarán la hora y media.": "延長戰局：從第 60 分鐘起，野生寶可夢的體力與傷害會不斷提高，成長速度也會越來越快。先前強化全滿後，有些戰局幾乎不會結束；調整後，表現最好的戰局預計約可持續一個半小時。",
   "El juego se actualiza solo cuando sale una versión nueva: si estás en el menú, a los 5 segundos; si estás jugando, al acabar la partida (sin perder nada).": "推出新版本時，遊戲會自動更新：停留在選單時會在 5 秒內更新；正在遊玩時則等本局結束後更新，不會遺失進度與獎勵。",
   "Botón de Novedades (esta ventana) con todos los cambios del juego.": "新增「更新公告」按鈕（就是這個視窗），可查看遊戲的各項更新。",
@@ -5528,13 +5564,13 @@
   "Mejoras nuevas para cada Pokémon: Golpe Crítico (+3 % de críticos por nivel, que hacen x1,5 de daño), Cambio de cartas (+1 cambio de las cartas de nivel por run) y Veto (bloquea movimientos para que no te salgan en las cartas; se eligen en Mejoras).": "各寶可夢新增強化項目：「擊中要害」（每級提高 3% 擊中要害機率，造成 1.5 倍傷害）、「卡片重抽」（每局升級卡片重抽次數 +1）及「招式封鎖」（在強化頁選擇招式，使其不再出現在升級卡片中）。",
   "Atajos de movimientos (en Mejoras, para cada Pokémon): elige qué movimiento va siempre en cada hueco, por ejemplo Confusión siempre en el 1, para la memoria muscular.": "招式欄位設定：可在各寶可夢的強化頁設定招式固定使用的欄位，例如將「念力」固定在第 1 格，方便熟悉操作。",
   "Avalancha hace menos daño (21 en vez de 26): derrotaba casi el doble que la media de los movimientos.": "「岩崩」傷害從 26 下調為 21；原本的擊敗數量接近一般招式的兩倍。",
-  "Los cambios de cartas de nivel ya no se ganan venciendo jefes: tienes 1 gratis por run y el resto se compra en Mejoras.": "擊敗頭目不再增加升級卡片的重抽次數。每局有 1 次免費重抽，可在強化頁購買額外次數。",
-  "Los legendarios de grieta ya no dan siempre tickets x10: dan uno la mitad de las veces (antes daban 2 siempre y salían demasiados).": "裂縫中的傳說寶可夢不再必定掉落十連抽獎券，改為 50% 機率掉落 1 張；先前必定掉落 2 張，數量過多。",
+  "Los cambios de cartas de nivel ya no se ganan venciendo jefes: tienes 1 gratis por run y el resto se compra en Mejoras.": "擊敗首領不再增加升級卡片的重抽次數。每局有 1 次免費重抽，可在強化頁購買額外次數。",
+  "Los legendarios de grieta ya no dan siempre tickets x10: dan uno la mitad de las veces (antes daban 2 siempre y salían demasiados).": "裂隙中的傳說寶可夢不再必定掉落十連抽獎券，改為 50% 機率掉落 1 張；先前必定掉落 2 張，數量過多。",
   "Cooperativo: si vuestras redes no consiguen conectar entre sí, la sala lo avisa y lo reintenta sola, en vez de jugar a tirones por un servidor lento.": "多人合作：若彼此的網路無法直接連線，房間會顯示提示並持續重試，不再改用速度較慢的伺服器而造成遊戲卡頓。",
   "Hemos cambiado de servidores para que el juego siga siendo gratis: puede que tengas que volver a iniciar sesión (con la misma cuenta y contraseña, o con Google). Tu partida y tus Pokémon siguen igual.": "為了讓遊戲持續免費營運，已搬遷至新的伺服器。你可能需要以原帳號密碼或 Google 重新登入；存檔與寶可夢不受影響。",
   "Gacha: los shiny ya no salen repetidos. Si te toca uno que ya tienes, sale otro de la misma rareza que te falte.": "扭蛋：閃光寶可夢不再重複。若抽到已擁有的閃光寶可夢，會改成同稀有度、尚未擁有的閃光寶可夢。",
-  "Grietas con menos azar: cada vez que no sale una, la siguiente es más probable (como mucho 2,5 minutos sin grieta).": "調整裂縫出現機制：每次未出現裂縫，下次出現的機率就會提高，最長不會超過 2.5 分鐘沒有裂縫。",
-  "Los legendarios que aún no has vencido salen 4 veces más en las grietas.": "尚未擊敗的傳說寶可夢，在裂縫中的出現機率提高為 4 倍。",
+  "Grietas con menos azar: cada vez que no sale una, la siguiente es más probable (como mucho 2,5 minutos sin grieta).": "調整裂隙出現機制：每次未出現裂隙，下次出現的機率就會提高，最長不會超過 2.5 分鐘沒有裂隙。",
+  "Los legendarios que aún no has vencido salen 4 veces más en las grietas.": "尚未擊敗的傳說寶可夢，在裂隙中的出現機率提高為 4 倍。",
   "Los curanderos curan más cuanto más fuerte pegas, pero cada vez menos y con un tope (como mucho el 2,5x).": "你的攻擊越強，治療型敵人的回復量也越高，但增幅會逐漸減少，最高為原本的 2.5 倍。",
   "Ataques cuerpo a cuerpo más fuertes: mientras llevas uno activo recibes un 25 % menos de daño, llegan un 25 % más lejos y hacen un 20 % más de daño.": "強化近戰招式：啟用近戰招式時，受到的傷害減少 25%；近戰攻擊距離增加 25%，傷害提高 20%。",
   "Cooperativo: al elegir con qué objeto quedarte, la partida se para para todos (antes seguía y te pegaban mientras elegías).": "多人合作：選擇要保留的攜帶道具時，所有玩家都會暫停；先前遊戲仍會繼續，選擇途中可能遭到攻擊。",
@@ -5554,7 +5590,7 @@
   "Vínculos": "羈絆",
   "Vínculos: al vencer a un legendario fusionas movimientos que se lanzan a la vez desde un solo hueco (hasta 4).": "羈絆：擊敗傳說寶可夢後，可以融合招式，讓同一欄位同時施放最多 4 個招式。",
   "Botón para cambiar las cartas de subir de nivel.": "新增升級卡片重抽按鈕。",
-  "Más grietas.": "增加裂縫出現頻率。",
+  "Más grietas.": "增加裂隙出現頻率。",
   "Movimientos psíquicos y curanderos más flojos.": "下調超能力系招式與治療型敵人的強度。",
   "Las mejoras de las cartas de nivel (velocidad, recarga, experiencia, imán, coraza y potencia) tienen un tope de veces.": "升級卡片中的速度、冷卻、經驗、磁力、防禦與威力強化，新增選取次數上限。",
   "En el móvil, la ficha del Pokémon sale al lado; entrar es más rápido y el gacha x10 se puede cerrar.": "手機版寶可夢詳細資料改為顯示在旁邊；登入速度更快，十連扭蛋畫面也可以關閉。",
@@ -5565,12 +5601,12 @@
   "11 October 2026": "2026 年 10 月 11 日",
   "11 de octubre de 2026": "2026 年 10 月 11 日",
   "Más reto": "更具挑戰性",
-  "Jefes y legendarios con 4 ataques avisados que se enfurecen a media vida.": "頭目與傳說寶可夢擁有 4 種附帶預警的攻擊，體力降至一半時會進入狂暴狀態。",
+  "Jefes y legendarios con 4 ataques avisados que se enfurecen a media vida.": "首領與傳說寶可夢擁有 4 種附帶預警的攻擊，體力降至一半時會進入狂暴狀態。",
   "12 movimientos nuevos y 8 formas de atacar nuevas: bumerán, cadena, minas, meteoros, torreta, embestida, rastro y abanico.": "新增 12 個招式與 8 種攻擊形式：迴旋、連鎖、地雷、隕石、砲塔、衝刺、軌跡及扇形攻擊。",
   "Eventos a mitad de partida (hordas de un tipo, hora dorada, Pokémon perdidos) y Meowth y Gholdengo que huyen cargados de monedas.": "新增戰局事件（單一系群襲、黃金時段、迷路的寶可夢），以及攜帶大量金幣逃跑的喵喵與賽富豪。",
   "Estatuas para los Pokémon grandes.": "為大型寶可夢新增雕像。",
   "Más difícil: menos enemigos pero más duros.": "提高難度：敵人數量減少，但實力更強。",
-  "Subir de nivel es más lento, los tickets son más raros y los jefes dan ticket x10 una de cada tres veces.": "升級速度降低，抽獎券更稀有；頭目有三分之一機率掉落 1 張十連抽獎券。",
+  "Subir de nivel es más lento, los tickets son más raros y los jefes dan ticket x10 una de cada tres veces.": "升級速度降低，抽獎券更稀有；首領有三分之一機率掉落 1 張十連抽獎券。",
   "Carga más rápida.": "加快載入速度。",
   "Los enemigos rezagados desaparecían delante de ti: ahora sólo fuera de la vista.": "修正落後的敵人在眼前消失的問題；現在只會在畫面外移除。",
   "Los menús y pantallas se montaban encima de la barra de arriba.": "修正選單與介面覆蓋頂部工具列的問題。",
@@ -5584,10 +5620,10 @@
   "Gigadrenado pasa a ser Hierba Lazo (ya no cura).": "「終極吸取」改為「打草結」，不再回復體力。",
   "9 October 2026": "2026 年 10 月 9 日",
   "9 de octubre de 2026": "2026 年 10 月 9 日",
-  "Misiones, grietas y cooperativo": "任務、裂縫與多人合作",
+  "Misiones, grietas y cooperativo": "任務、裂隙與多人合作",
   "Misiones diarias y semanales, logros con medallas y títulos, y perfil público.": "新增每日與每週任務、附帶獎章與稱號的成就，以及公開個人檔案。",
   "Objetos equipables, evoluciones de movimientos y enemigos que curan, protegen, invocan o explotan.": "新增攜帶道具、招式進化，以及會治療、提供護盾、召喚或爆炸的敵人。",
-  "Grietas que llevan a 18 arenas legendarias, una por tipo, y clima que cambia la batalla.": "新增通往 18 座傳說競技場的裂縫（各系一座），以及會影響戰鬥的天氣。",
+  "Grietas que llevan a 18 arenas legendarias, una por tipo, y clima que cambia la batalla.": "新增通往 18 座傳說競技場的裂隙（各系一座），以及會影響戰鬥的天氣。",
   "Cooperativo con tu lista de amigos y ranking.": "新增好友名單、多人合作與排行榜。",
   "Mejoras para cada Pokémon, gacha tragaperras con tickets y tabla de tipos.": "新增各寶可夢的強化系統、使用抽獎券的拉霸式扭蛋，以及系相剋表。",
   "Cámara más lejos y enemigos que rodean los obstáculos.": "拉遠鏡頭，敵人也會繞過障礙物。",
@@ -5596,7 +5632,224 @@
   "Primera versión": "首個版本",
   "Primera versión pública de PokéSurvivor.": "PokéSurvivor 首次公開發佈。",
   "7 October 2026": "2026 年 10 月 7 日",
-  "7 de octubre de 2026": "2026 年 10 月 7 日"
+  "7 de octubre de 2026": "2026 年 10 月 7 日",
+  "Web oficial": "官方網站",
+  "Official website": "官方網站",
+  "Esta no es la web oficial: la partida sólo se guarda en este navegador. El juego oficial y gratis está en pokesurvivor.com.": "這不是官方網站：進度僅儲存於此瀏覽器。免費的官方遊戲位於 pokesurvivor.com。",
+  "This is not the official website: your game is only saved in this browser. The official, free game is at pokesurvivor.com.": "這不是官方網站：進度僅儲存於此瀏覽器。免費的官方遊戲位於 pokesurvivor.com。",
+  "Colocar los botones": "調整按鈕位置",
+  "Place the buttons": "調整按鈕位置",
+  "Colocar": "調整位置",
+  "Place": "調整位置",
+  "Pon los ataques, la pausa y el joystick (fijo, si quieres) donde quieras de la pantalla.": "可自由擺放攻擊、暫停與搖桿按鈕，也可將搖桿設為固定位置。",
+  "Put the attacks, the pause button and the joystick (fixed, if you like) anywhere on the screen.": "可自由擺放攻擊、暫停與搖桿按鈕，也可將搖桿設為固定位置。",
+  "Arrastra los botones a donde quieras": "拖曳按鈕至想要的位置",
+  "Drag the buttons wherever you want": "拖曳按鈕至想要的位置",
+  "Gira el móvil: se juega en horizontal.": "請旋轉手機，以橫向模式遊玩。",
+  "Turn your phone: the game is played in landscape.": "請旋轉手機，以橫向模式遊玩。",
+  "Joystick": "搖桿",
+  "Flotante": "浮動",
+  "Floating": "浮動",
+  "Fijo": "固定",
+  "Fixed": "固定",
+  "Ataques": "攻擊",
+  "Attacks": "攻擊",
+  "Flotante: aparece donde pones el dedo. Fijo: siempre en el mismo sitio.": "浮動：出現在手指觸碰的位置。固定：始終位於同一位置。",
+  "Floating: it appears where you put your finger. Fixed: always in the same place.": "浮動：出現在手指觸碰的位置。固定：始終位於同一位置。",
+  "Restablecer": "重設",
+  "Reset": "重設",
+  "Guardar": "儲存",
+  "Botones colocados": "按鈕位置已儲存",
+  "Buttons placed": "按鈕位置已儲存",
+  "La única web oficial de PokéSurvivor es pokesurvivor.com. El juego es y será gratis: si alguien te pide pagar, no somos nosotros.": "PokéSurvivor 唯一的官方網站是 pokesurvivor.com。遊戲永遠免費：任何要求付款的人都不代表我們。",
+  "The only official PokéSurvivor website is pokesurvivor.com. The game is and always will be free: if anyone asks you to pay, it isn't us.": "PokéSurvivor 唯一的官方網站是 pokesurvivor.com。遊戲永遠免費：任何要求付款的人都不代表我們。",
+  "Licencia del código: PolyForm Noncommercial 1.0.0 (se puede usar, estudiar y modificar, pero no para ganar dinero). Las versiones hasta el 14-10-2026 siguen bajo MIT.": "程式碼授權：PolyForm Noncommercial 1.0.0（可使用、研究及修改，但不得營利）。截至 2026-10-14 的舊版本維持 MIT 授權。",
+  "Code license: PolyForm Noncommercial 1.0.0 (you may use, study and modify it, but not to make money). Versions up to 14-10-2026 remain under MIT.": "程式碼授權：PolyForm Noncommercial 1.0.0（可使用、研究及修改，但不得營利）。截至 2026-10-14 的舊版本維持 MIT 授權。",
+  "Web oficial: pokesurvivor.com · si alguien te pide pagar, no somos nosotros": "官方網站：pokesurvivor.com · 任何要求付款的人都不代表我們",
+  "Official website: pokesurvivor.com · if anyone asks you to pay, it isn't us": "官方網站：pokesurvivor.com · 任何要求付款的人都不代表我們",
+  "Si creas una cuenta, guardamos tu nombre de jugador y tu partida (colección, monedas, mejoras y estadísticas) en Google Firebase para que puedas seguir en cualquier ordenador. Si entras con Google, Firebase guarda también tu correo de Google para identificarte (nunca se enseña a otros jugadores). No usamos tus datos para nada más, ni los compartimos, ni hay publicidad ni seguimiento. Como invitado no se guarda nada fuera de tu navegador.": "若你建立帳號，我們會將玩家名稱與遊戲進度（收藏、金幣、強化及統計）儲存於 Google Firebase，讓你能跨電腦繼續遊玩。使用 Google 登入時，Firebase 也會儲存 Google 電子郵件以識別身分，但不會向其他玩家公開。我們不會將資料用於其他用途或分享，也沒有廣告與追蹤。訪客的資料不會儲存於瀏覽器以外的位置。",
+  "If you create an account, we store your player name and your game (collection, coins, upgrades and stats) in Google Firebase so you can continue on any computer. If you sign in with Google, Firebase also stores your Google email to identify you (it is never shown to other players). We don't use your data for anything else, we don't share it, and there are no ads or tracking. As a guest, nothing is stored outside your browser.": "若你建立帳號，我們會將玩家名稱與遊戲進度（收藏、金幣、強化及統計）儲存於 Google Firebase，讓你能跨電腦繼續遊玩。使用 Google 登入時，Firebase 也會儲存 Google 電子郵件以識別身分，但不會向其他玩家公開。我們不會將資料用於其他用途或分享，也沒有廣告與追蹤。訪客的資料不會儲存於瀏覽器以外的位置。",
+  "Actualización obligatoria: tu partida se guarda y el juego se recarga en {x} s…": "必要更新：本局進度將儲存，遊戲將於 {x} 秒後重新載入…",
+  "Required update: your run is saved and the game reloads in {x} s…": "必要更新：本局進度將儲存，遊戲將於 {x} 秒後重新載入…",
+  "Actualizaciones obligatorias": "必要更新",
+  "Cuando una actualización sea obligatoria (por ejemplo, para arreglar un fallo importante), la partida en curso se termina tras un aviso de 10 s y el juego se recarga. No pierdes nada: las monedas, los tickets, los récords y el ranking de esa partida se guardan como al abandonarla.": "遇到必要更新（例如修正重大錯誤）時，遊戲會顯示 10 秒倒數提示，接著結束本局並重新載入。本局獲得的金幣、抽獎券、紀錄與排行榜成績，都會如同主動結束遊戲時儲存，不會遺失。",
+  "Jugar en dos aparatos (PC y móvil) ya no hace perder monedas ni tickets: antes, si uno tenía la partida abierta con datos viejos y guardaba, borraba lo ganado en el otro. Ahora se suma lo de los dos. Y al volver al juego tras un rato fuera, se trae lo conseguido en el otro aparato (Pokémon, shinies...) sin recargar.": "同時在兩台裝置（電腦與手機）遊玩，不再遺失金幣或抽獎券。先前若用舊資料存檔，可能覆蓋另一台裝置獲得的獎勵；現在會合計兩邊的收穫。離開遊戲一段時間後返回，也會自動同步另一台裝置獲得的寶可夢、閃光寶可夢等資料，無須重新載入。",
+  "Móvil: ya puedes colocar los botones donde quieras. En Ajustes > Controles > Colocar los botones arrastras los ataques (con el objeto), la pausa y el joystick, que ahora también puede ser fijo en vez de aparecer donde pones el dedo.": "手機：可在「設定 > 操作 > 調整按鈕位置」拖曳招式、道具、暫停與搖桿按鈕。搖桿也能設為固定位置。",
+  "Aviso importante: la única web oficial de PokéSurvivor es pokesurvivor.com. El juego es y será gratis: si alguna otra web te pide pagar (por tickets, monedas o lo que sea), no somos nosotros. Lo verás también al entrar y en el Aviso legal.": "重要提醒：唯一官方網站為 pokesurvivor.com。遊戲永遠免費，其他網站要求購買抽獎券、金幣或任何項目，都不代表我們。登入畫面與法律聲明也會顯示此提醒。",
+  "El código del juego pasa a una licencia no comercial (PolyForm Noncommercial 1.0.0): se puede seguir estudiando y modificando, pero nadie puede cobrar por él.": "程式碼改採非商業授權 PolyForm Noncommercial 1.0.0。仍可研究與修改，但任何人都不得藉此收費。",
+  "Los avisos grandes de la partida (un Gholdengo cerca, una marea...) ya salen siempre centrados.": "遊戲中的大型提示（附近的賽富豪、敵群等）現在會正確置中。",
+  "Shinies": "閃光寶可夢",
+  "niveles": "級",
+  "Traducción al chino tradicional": "繁體中文化",
+  "El juego ahora incluye chino tradicional: menús, movimientos, objetos, misiones, avisos y nombres de los 966 Pokémon. Se puede cambiar el idioma en Ajustes > Gráficos.": "新增繁體中文：選單、招式、道具、任務、提示與 966 隻寶可夢名稱。可在「設定 → 畫面」切換語言。",
+  "Este mes se han llenado las plazas de cuentas nuevas: vuelven el 1 de": "本月新帳號名額已滿，將於下個月 1 日重新開放：",
+  ". Si ya tienes cuenta, entra normal. Si no, juega como invitado.": "。已有帳號可照常登入，其他玩家可先以訪客身分遊玩。",
+  "marcas de más de 1 hora (": "筆超過 1 小時的紀錄（",
+  "No se pudo:": "無法完成：",
+  "· sólo": "· 僅",
+  "· ya no está en el top 50": "· 已不在前 50 名",
+  "No se pudo cargar (": "無法載入（",
+  "Faltan por elegir:": "尚未選擇：",
+  "Ya tienes": "你已擁有",
+  "tickets": "抽獎券",
+  "ticket": "抽獎券",
+  "monedas": "金幣",
+  "Ver su perfil": "檢視個人檔案",
+  "POKé SLOTS": "寶可夢拉霸",
+  "No hace daño: acumula ATAQUE (físico) más rápido que Danza Espada.": "不造成傷害：累積物理攻擊力的速度比劍舞更快。",
+  "Deals no damage: builds (physical) ATTACK faster than Swords Dance.": "不造成傷害：累積物理攻擊力的速度比劍舞更快。",
+  "No hace daño: acumula ATAQUE (físico) mientras esté activo.": "不造成傷害：啟用時持續累積物理攻擊力。",
+  "Deals no damage: builds (physical) ATTACK while active.": "不造成傷害：啟用時持續累積物理攻擊力。",
+  "No hace daño: acumula ATAQUE ESPECIAL mientras esté activo.": "不造成傷害：啟用時持續累積特殊攻擊力。",
+  "Deals no damage: builds SPECIAL ATTACK while active.": "不造成傷害：啟用時持續累積特殊攻擊力。",
+  "Maquinación": "詭計",
+  "Nasty Plot": "詭計",
+  "Mando conectado": "控制器已連線",
+  "Controller connected": "控制器已連線",
+  "Con mando": "使用控制器",
+  "With a controller": "使用控制器",
+  "Usar mando": "啟用控制器",
+  "Use controller": "啟用控制器",
+  "Mando conectado:": "已連線的控制器：",
+  "Controller connected:": "已連線的控制器：",
+  "Vibración": "震動",
+  "Vibration": "震動",
+  "Xbox, PlayStation, Switch y la mayoría de mandos USB o Bluetooth. Conéctalo y pulsa cualquier botón.": "支援 Xbox、PlayStation、Switch 及多數 USB 或藍牙控制器。連接後按下任意按鈕即可。",
+  "Xbox, PlayStation, Switch and most USB or Bluetooth controllers. Connect it and press any button.": "支援 Xbox、PlayStation、Switch 及多數 USB 或藍牙控制器。連接後按下任意按鈕即可。",
+  "Moverte, cambiar de ataque y manejar los menús con el mando.": "使用控制器移動、切換招式及操作選單。",
+  "Move, switch attacks and use the menus with a controller.": "使用控制器移動、切換招式及操作選單。",
+  "El mando vibra al recibir daño (si el mando y el navegador lo permiten).": "受到傷害時控制器會震動（需控制器與瀏覽器支援）。",
+  "The controller vibrates when you take damage (if your controller and browser support it).": "受到傷害時控制器會震動（需控制器與瀏覽器支援）。",
+  "Stick izq.": "左搖桿",
+  "Left stick": "左搖桿",
+  "Cruceta": "方向鍵",
+  "D-pad": "方向鍵",
+  "Stick der.": "右搖桿",
+  "Right stick": "右搖桿",
+  "moverse · elegir en los menús": "移動 · 在選單中選擇",
+  "move · choose in menus": "移動 · 在選單中選擇",
+  "pulsar (en los menús) · saltar la animación de Arceus": "確認選單選項 · 跳過阿爾宙斯動畫",
+  "press (in menus) · skip the Arceus cutscene": "確認選單選項 · 跳過阿爾宙斯動畫",
+  "atrás / cerrar": "返回／關閉",
+  "back / close": "返回／關閉",
+  "cambiar las cartas al subir de nivel": "重抽升級卡片",
+  "reroll the cards when leveling up": "重抽升級卡片",
+  "desplazar las listas": "捲動清單",
+  "scroll lists": "捲動清單",
+  "desplazar las listas · apuntar (si activas Apuntar a mano en Accesibilidad)": "捲動清單 · 瞄準（需在無障礙設定中啟用手動瞄準）",
+  "scroll lists · aim (if you turn on Manual aim in Accessibility)": "捲動清單 · 瞄準（需在無障礙設定中啟用手動瞄準）",
+  "Buscar por nombre o número": "依名稱或圖鑑編號搜尋",
+  "Search by name or number": "依名稱或圖鑑編號搜尋",
+  "Limpiar": "清除",
+  "Clear": "清除",
+  "Todas": "全部",
+  "Favoritos": "最愛",
+  "Favorites": "最愛",
+  "Orden:": "排序：",
+  "Sort:": "排序：",
+  "Rareza": "稀有度",
+  "Rarity": "稀有度",
+  "Recién conseguidos": "最近獲得",
+  "Recently caught": "最近獲得",
+  "Más usados": "最常使用",
+  "Most played": "最常使用",
+  "Todos los tipos": "所有屬性",
+  "All types": "所有屬性",
+  "Favorito": "最愛",
+  "Favorite": "最愛",
+  "Marcar como favorito": "加入最愛",
+  "Mark as favorite": "加入最愛",
+  "Ninguno con estos filtros.": "沒有符合這些條件的寶可夢。",
+  "None with these filters.": "沒有符合這些條件的寶可夢。",
+  "{x} Pokémon": "{x} 隻寶可夢",
+  "1 Pokémon": "1 隻寶可夢",
+  "Físico": "物理",
+  "Physical": "物理",
+  "Especial": "特殊",
+  "Special": "特殊",
+  "At. Esp.": "特攻",
+  "Sp. Atk": "特攻",
+  "Defensa": "防禦",
+  "Defense": "防禦",
+  "Def. Esp.": "特防",
+  "Sp. Def": "特防",
+  "Pega mejor con ataques": "擅長的招式類型：",
+  "Hits harder with": "擅長的招式類型：",
+  "especiales": "特殊",
+  "special moves": "特殊",
+  "físicos": "物理",
+  "physical moves": "物理",
+  "Con {x} rinde un {x} %: pega mejor con ataques especiales.": "使用 {x} 時可發揮 {x}% 威力：更擅長特殊招式。",
+  "With {x} it deals {x} %: it hits harder with special moves.": "使用 {x} 時可發揮 {x}% 威力：更擅長特殊招式。",
+  "Con {x} rinde un {x} %: pega mejor con ataques físicos.": "使用 {x} 時可發揮 {x}% 威力：更擅長物理招式。",
+  "With {x} it deals {x} %: it hits harder with physical moves.": "使用 {x} 時可發揮 {x}% 威力：更擅長物理招式。",
+  "Tus ataques": "你的招式",
+  "Your moves": "你的招式",
+  "Por segundo": "每秒",
+  "Per second": "每秒",
+  "Tus estadísticas": "你的能力數值",
+  "Your stats": "你的能力數值",
+  "Crítico": "擊中要害",
+  "Critical": "擊中要害",
+  "Reducción de daño": "傷害減免",
+  "Damage reduction": "傷害減免",
+  "Regeneración": "體力回復",
+  "Regeneration": "體力回復",
+  "Objeto y cartas": "道具與卡片",
+  "Item and cards": "道具與卡片",
+  "Sin objeto.": "未攜帶道具。",
+  "No item.": "未攜帶道具。",
+  "Aún no has cogido cartas de mejora.": "尚未取得強化卡片。",
+  "You haven’t picked any upgrade cards yet.": "尚未取得強化卡片。",
+  "{x} físico": "物理 {x}",
+  "{x} physical": "物理 {x}",
+  "{x} especial": "特殊 {x}",
+  "{x} special": "特殊 {x}",
+  "Accesibilidad": "無障礙",
+  "Accessibility": "無障礙",
+  "Apuntado": "瞄準",
+  "Aiming": "瞄準",
+  "Apuntar a mano": "手動瞄準",
+  "Manual aim": "手動瞄準",
+  "Tus ataques van hacia el ratón (o hacia donde empujes el stick derecho del mando) en vez de al enemigo más cercano. Si sueltas el stick y no mueves el ratón, vuelve a apuntar solo. La cadena y los meteoros siguen buscando a los enemigos solos.": "招式會朝滑鼠或控制器右搖桿指向的方向施放，而非最近的敵人。放開搖桿且不移動滑鼠時，會恢復自動瞄準。連鎖與流星類招式仍會自動追蹤敵人。",
+  "Your attacks go towards the mouse (or wherever you push the controller’s right stick) instead of the nearest enemy. If you let go of the stick and don’t move the mouse, it aims by itself again. Chain and meteor moves still find enemies by themselves.": "招式會朝滑鼠或控制器右搖桿指向的方向施放，而非最近的敵人。放開搖桿且不移動滑鼠時，會恢復自動瞄準。連鎖與流星類招式仍會自動追蹤敵人。",
+  "Guardar la partida en la nube": "將進度儲存至雲端",
+  "Save your game to the cloud": "將進度儲存至雲端",
+  "Tu partida se guarda en este navegador.": "遊戲進度儲存於此瀏覽器。",
+  "Your game is saved in this browser.": "遊戲進度儲存於此瀏覽器。",
+  "Como invitado la partida no se guarda.": "訪客模式不會保留遊戲進度。",
+  "As a guest your game is not saved.": "訪客模式不會保留遊戲進度。",
+  "Ya está todo guardado en la nube.": "所有進度皆已儲存至雲端。",
+  "Everything is already saved in the cloud.": "所有進度皆已儲存至雲端。",
+  "Sin conexión: se guardará en cuanto vuelva.": "目前離線：恢復連線後將自動儲存。",
+  "Offline: it will be saved as soon as you are back online.": "目前離線：恢復連線後將自動儲存。",
+  "No se pudo guardar. Vuelve a probar en un momento.": "無法儲存，請稍後再試。",
+  "Could not save. Try again in a moment.": "無法儲存，請稍後再試。",
+  "Se guarda en la nube en {x} s.": "將於 {x} 秒後儲存至雲端。",
+  "Saving to the cloud in {x} s.": "將於 {x} 秒後儲存至雲端。",
+  "¡Partida guardada en la nube!": "進度已儲存至雲端！",
+  "Game saved to the cloud!": "進度已儲存至雲端！",
+  "Físico y especial, mando, botón Guardar y rankings desde cero": "物理與特殊招式、控制器、儲存按鈕及排行榜重置",
+  "Ataques físicos y especiales, como en los juegos: cada Pokémon tiene su Ataque, Ataque Especial, Defensa y Defensa Especial. Los ataques físicos pegan con su Ataque y los especiales con su Ataque Especial: Machamp pega fuerte con Golpe Kárate y flojo con Bola Sombra. Con los de su lado bueno pega lo mismo que antes. Al subir de nivel, cada carta dice si el ataque es físico o especial y cuánto rinde con tu Pokémon, y en la colección se ven todas sus estadísticas.": "如同原作，每隻寶可夢現在都有攻擊、特攻、防禦與特防。物理招式使用攻擊，特殊招式使用特攻：怪力使用空手劈時威力強，使用暗影球時較弱。擅長類型的招式仍維持原有威力。升級卡片會顯示招式類型及適合程度，收藏頁面也會顯示完整能力數值。",
+  "Danza Espada y Danza Dragón suben sólo el Ataque (físico), como en los juegos, y llega Maquinación, que sube el Ataque Especial y la puede aprender cualquier Pokémon. Al subir de nivel, los ataques del lado bueno de tu Pokémon salen el doble de a menudo.": "劍舞與龍之舞現在只提升物理攻擊，並新增所有寶可夢皆可學習、提升特攻的詭計。升級時，寶可夢擅長類型的招式出現機率加倍。",
+  "Resumen de la partida en la pausa: cada ataque con su categoría, el daño que lleva hecho y su daño por segundo; tus estadísticas con todo lo que has subido; y el objeto y las cartas de mejora que llevas.": "暫停畫面新增本局摘要：顯示各招式的類型、累計傷害與每秒傷害、強化後的能力數值，以及攜帶道具和強化卡片。",
+  "Las defensas también cuentan (un poco): los enemigos se defienden de tus ataques físicos con su Defensa y de los especiales con su Defensa Especial, y cada enemigo te pega con su lado fuerte, que paras con tu Defensa o tu Defensa Especial.": "防禦能力也會略微影響傷害：敵人以防禦抵擋物理招式、以特防抵擋特殊招式。敵人會使用自身擅長的攻擊類型，你的防禦或特防則會減輕相應傷害。",
+  "Ya se puede jugar con mando (Xbox, PlayStation, Switch y la mayoría de mandos USB o Bluetooth): moverte, cambiar de ataque, pausar, elegir cartas y manejar todos los menús, con vibración al recibir daño. Se configura en Ajustes > Controles.": "支援 Xbox、PlayStation、Switch 及多數 USB 或藍牙控制器，可移動、切換招式、暫停、選擇卡片及操作所有選單，受到傷害時也會震動。可在「設定 > 操作」調整。",
+  "Colección: buscador por nombre o número, pestaña con todas las generaciones, filtros que se combinan (tengo / me faltan, varias rarezas a la vez, shiny, favoritos y tipo) y orden por número, nombre, rareza, recién conseguidos o más usados. Y favoritos: márcalos en la ficha de cada Pokémon; van con tu cuenta, en todos tus aparatos.": "收藏新增名稱與編號搜尋、所有世代分頁、可組合的篩選條件（已擁有／未擁有、多種稀有度、閃光、最愛及屬性），以及編號、名稱、稀有度、最近獲得與最常使用排序。可在寶可夢詳細資料中加入最愛，並隨帳號跨裝置同步。",
+  "Nueva pestaña Accesibilidad en Ajustes con «Apuntar a mano»: tus ataques van hacia el ratón o hacia donde empujes el stick derecho del mando, en vez de al enemigo más cercano. Viene desactivado.": "設定新增「無障礙」分頁及預設關閉的「手動瞄準」：招式會朝滑鼠或控制器右搖桿指向的方向施放，而非最近的敵人。",
+  "Botón Guardar arriba a la derecha: sube tu partida a la nube al momento. Úsalo antes de cerrar el juego o de cambiar de aparato.": "右上角新增「儲存」按鈕，可立即將進度上傳至雲端。關閉遊戲或切換裝置前，請先儲存。",
+  "Las cartas de nivel, de vínculo y de objeto no se pueden elegir durante un momento al aparecer (se ven apagadas): pulsar 1-4 o tocar la pantalla para cambiar de ataque en plena pelea ya no elige una carta sin querer.": "升級、羈絆與道具卡片出現後，會短暫呈現暗色且無法選取，避免戰鬥中按下 1–4 或觸控切換招式時誤選卡片。",
+  "Con mando ya se pueden elegir en la colección los Pokémon que aún no tienes, y en el móvil las pestañas de Ajustes caben en una fila que se desliza.": "使用控制器時，也能在收藏中選取尚未擁有的寶可夢。手機上的設定分頁改為可橫向捲動的單列。",
+  "La partida se guarda en la nube automáticamente cada 10 minutos.": "遊戲進度每 10 分鐘自動儲存至雲端。",
+  "Ranking histórico: si estás por debajo del puesto 1.000, sale «#1000+» en vez del número exacto.": "歷史排行榜超過第 1,000 名時，會顯示「#1000+」，不再顯示確切排名。",
+  "Los Pokémon grandes (Onix, Gyarados, Wailord, Eternatus, los legendarios...) ya se pueden jugar bien: se ven algo más pequeños, aunque siguen siendo de los más grandes, y chocan como uno normal, así que caben por todos los pasillos y no reciben más golpes por su tamaño.": "大岩蛇、暴鯉龍、吼鯨王、無極汰那與大型傳說寶可夢等，現在能正常遊玩。顯示尺寸稍微縮小，但仍屬大型寶可夢；碰撞範圍與一般寶可夢相同，可通過所有走廊，也不會因體型較大而受到更多攻擊。",
+  "Como mucho hay 3 curanderos, 3 escuderos y 3 invocadores a la vez.": "同時最多出現 3 隻治療者、3 隻護盾者與 3 隻召喚者。",
+  "Los curanderos y escuderos ya no hacen inmatable a un jefe: lo que le curan y el escudo que le ponen van con el daño que le estás haciendo, y sólo recibe un escudo cada 6 segundos.": "治療者與護盾者不再讓首領無法擊敗：治療量與護盾量會依你造成的傷害調整，首領每 6 秒最多獲得一次護盾。",
+  "Sentencia de Arceus: la velocidad tiene un tope suave (lo que pase de cierto punto cuenta mucho menos) y los legendarios corren casi tanto como tú. Desde los 5 minutos de Sentencia Arceus acelera sin parar, y desde los 7 su toque quita cada vez más vida, hasta dejarte KO de un golpe hacia el minuto 40.": "阿爾宙斯的審判：移動速度新增軟上限，超過一定數值後的增益大幅降低，傳說寶可夢的速度也接近玩家。審判開始 5 分鐘後，阿爾宙斯會持續加速；7 分鐘後，接觸傷害逐漸提高，約在遊戲第 40 分鐘時可一擊擊倒玩家。",
+  "El veneno sigue quitando un porcentaje de la vida, pero contra enemigos con muchísima vida (los legendarios de la Sentencia) ese porcentaje es menor.": "中毒仍依體力比例造成傷害，但對體力極高的敵人（審判中的傳說寶可夢）效果會降低。",
+  "Todos los rankings empiezan de cero (hoy, semana, mes, año e histórico): las marcas de huir de Arceus ya no se podrían alcanzar.": "每日、每週、每月、每年及歷史排行榜全部重置，因先前靠逃離阿爾宙斯達成的紀錄已無法重現。",
+  "Seguridad: se ha cerrado un agujero por el que alguien podía meter código en su fila del ranking o en su perfil y hacer que se ejecutara en el navegador de quien los abría (a algunos les llevaba a un vídeo). Ahora todo lo que viene de otros jugadores se limpia, el servidor sólo deja guardar lo que debe, y el navegador no ejecuta nada que no sea del juego.": "安全修正：封堵了玩家在排行榜或個人檔案插入程式碼、於其他玩家瀏覽器中執行的漏洞（部分玩家曾被導向影片）。現在會清理其他玩家提供的資料，伺服器只接受合法內容，瀏覽器也只執行遊戲本身的程式碼。",
+  "En el ranking ya salen en shiny los Pokémon de quien jugó con su shiny.": "使用閃光寶可夢遊玩的玩家，排行榜現在會正確顯示閃光版本。"
 };
   const exact = new Map(), lower = new Map(), fragments = new Map(), patterns = [];
   const cache = new Map(), translatedNodes = new WeakMap();
@@ -5805,7 +6058,7 @@
     },
     reload: reloadBot,
     handoff() {
-      const state = { game: game || capturedGame, offers, offered, bondChoice, rerollState, settings: { ...settings } };
+      const state = { game: game || capturedGame, offers, offered, bondChoice, itemChoice, rerollState, settings: { ...settings } };
       api.destroy();
       return state;
     },
