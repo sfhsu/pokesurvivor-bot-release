@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.22
+// @version      1.4.23
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，中文翻譯與單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.22';
+  const VERSION = '1.4.23';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -473,12 +473,14 @@
   const buffRank = m => m?.kind === 'buff' ? (poisonBuild(game.Game.player)
     ? {def:4,regen:3,spd:2,atk:1} : {atk:4,spd:3,def:2,regen:1})[buffStat(m)] || 0 : 0;
   const control = m => !!(m.slow || m.burn || m.poison);
+  const rangedProjectile = m => ['projectile','homing','bounce'].includes(m?.kind);
+  const survivalControl = m => !!(m?.stun || m?.kind==='shove' || m?.kind==='vortex');
   // Trails tick repeatedly; mines persist until triggered, then burst once.
   // Status effects, falling meteors and shooting turrets are not ground residue.
-  const groundRank = m => m?.kind === 'trail' ? 2 : m?.kind === 'mine' ? 1 : 0;
+  const groundRank = m => ['trail','vortex'].includes(m?.kind) ? 2 : m?.kind === 'mine' ? 1 : 0;
   function kitePairRank(slot) {
     const attacks = slot.filter(damaging);
-    if (attacks.length !== 2 || !attacks.some(m => m.kind === 'projectile')) return 0;
+    if (attacks.length !== 2 || !attacks.some(rangedProjectile)) return 0;
     return Math.max(...attacks.map(groundRank));
   }
   function moveProfile(m) {
@@ -491,10 +493,14 @@
       case 'orbit': mode = 'orbit'; reach = radius * 0.7 + (m.size || 8); ideal = radius * 0.7; break;
       case 'cone': reach = (m.speed || 300) * (m.life || 0.4) * 0.85; ideal = reach * 0.72; break;
       case 'beam': reach = radius; ideal = Math.min(230, reach * 0.75); break;
+      case 'charge': reach = radius; ideal = Math.min(230,reach*0.75); break;
+      case 'spin': case 'shove': mode='close'; reach=radius; ideal=radius*0.85; break;
+      case 'quake': reach=(m.count || 1)*34+radius; ideal=Math.min(230,reach*0.75); break;
+      case 'vortex': case 'stun': reach=300; ideal=220; break;
       case 'boomerang': reach = radius; ideal = reach * 0.72; break;
       case 'chain': reach = 280; ideal = 200; break;
       case 'meteor': reach = 340; ideal = 240; break;
-      case 'projectile': reach = Math.min(520, (m.speed || 300) * (m.life || 1.5)); ideal = Math.min(240, reach * 0.65); break;
+      case 'projectile': case 'homing': case 'bounce': reach = Math.min(520, (m.speed || 300) * (m.life || 1.5)); ideal = Math.min(240, reach * 0.65); break;
       case 'nova': reach = (m.speed || 250) * (m.life || 1); ideal = Math.min(160, reach * 0.55); break;
       case 'trail': case 'mine': mode = 'lure'; reach = radius; ideal = 130; break;
       case 'turret': mode = 'turret'; reach = m.range || 280; ideal = reach * 0.65; break;
@@ -507,16 +513,21 @@
     if (!damaging(m)) return 0;
     const base = ({ projectile: 56, beam: 55, chain: 59, meteor: 53, nova: 48,
       boomerang: 51, aura: 50, orbit: 51, cone: 48, melee: 32, dash: 32,
-      trail: 38, mine: 34, turret: 53 })[m.kind] || 35;
+      trail: 38, mine: 34, turret: 53, homing:58,bounce:57,charge:46,spin:32,
+      quake:48,vortex:55,shove:43,stun:54 })[m.kind] || 35;
     let value = base + clamp((m.dmg || 10) / Math.max(0.2, m.cd || 1) / 5, 0, 18);
     value += Math.min(9, (m.count || 1) * 1.5) + Math.min(8, (m.pierce || 0) * 3);
     value += m.slow ? 7 : 0;
     value += m.homing ? 5 : 0;
+    value += m.drain ? 15 : 0;
+    value += survivalControl(m) ? 10 : 0;
     value += m.evolved ? 24 : 0;
     if (m.hex && companions.some(control)) value += 18;
     if (control(m) && companions.some(other => other.hex)) value += 12;
     // Prefer other attacks when learning or fusing; Substitute remains usable.
     if (m.id === 'substitute') value -= 25;
+    const p=game?.Game.player;
+    value*=clamp(game.Stats?.fit?.(p?.mon,m.cat) ?? 1,0.25,1.2);
     return value;
   }
   function slotValue(slot) {
@@ -528,14 +539,18 @@
   // A conservative damage model for build decisions, not measured combat DPS.
   function moveDamageRate(m) {
     if (!damaging(m)) return 0;
+    if(m.kind==='vortex') return (m.dmg || 0)*Math.min(2,(m.dur || 2.6)/Math.max(0.05,m.cd || 3))/0.4;
+    if(m.kind==='spin') return (m.dmg || 0)*Math.max(1,m.count || 1)/Math.max(0.05,m.cd || 1)*0.7;
     const count=Math.min(3,1+Math.max(0,(m.count || 1)-1)*0.5);
     const period=m.kind === 'trail' ? 0.5 : m.kind === 'turret' ? (m.rate || 0.6)
       : m.kind === 'orbit' ? 0.5 : Math.max(0.05,m.cd || 1);
     return Math.max(0,m.dmg || 0)*count/period*(m.kind === 'dash' || m.kind === 'melee' ? 0.7 : 1);
   }
   function slotDamageRate(p,slot,castBuff=false) {
-    let value=slot.reduce((sum,m)=>sum+moveDamageRate(m)
-      /(['trail','turret','orbit'].includes(m.kind) ? 1 : Math.max(0.05,p.cdMul || 1)),0)*Math.max(0.01,p.atk || 1);
+    let value=slot.reduce((sum,m)=>sum+(m.kind==='vortex'
+      ? (m.dmg || 0)*Math.min(2,(m.dur || 2.6)/Math.max(0.05,(m.cd || 3)*(p.cdMul || 1)))/0.4
+      : moveDamageRate(m)/(['trail','turret','orbit'].includes(m.kind) ? 1 : Math.max(0.05,p.cdMul || 1)))
+      * Math.max(0.01,p.atk || 1)*(game.Stats?.fit?.(p.mon,m.cat) ?? 1),0);
     // Credit one real attack-buff cast, rather than assuming five free stacks.
     if (castBuff) for (const m of slot.filter(m=>m.kind === 'buff' && m.stat === 'atk')) {
       const b=p.buffs?.atk, factor=1+(b?.n || 0)*(b?.amount || 0);
@@ -646,6 +661,7 @@
     const excessBuffs = Math.max(0,slot.filter(m => m.kind === 'buff').length - 2);
     if(poisonBuild(game.Game.player)) return (slot.some(m=>damaging(m) && m.poison>0)?10000000:0)
       + stats.has('def')*1000000 + stats.has('regen')*100000
+      + slot.some(m=>m.drain)*50000 + slot.some(survivalControl)*1000
       + (attacks>=2?10000:0) + kitePairRank(slot)*250
       + stats.has('atk')*1000 + stats.has('spd')*100
       - (excessBuffs+Math.max(0,attacks-2))*20000000 + Math.min(99,slotValue(slot)/10);
@@ -694,6 +710,11 @@
           && !moves.some(other=>other.kind==='buff' && other.stat===m.stat)) return 250+rank;
       }
       if(m?.poison>0 && (c.type==='up' || c.type==='evo')) return 230;
+      if(m?.drain && (c.type==='up' || c.type==='evo')) return 235;
+      if(c.type==='new' && damaging(m) && moves.filter(damaging).length<2) {
+        if(m.drain)return 248;
+        if(survivalControl(m))return 238;
+      }
       if(c.type==='up' || c.type==='evo') return 30;
       if(c.key==='stat:cd') return 45;
     }
@@ -748,8 +769,8 @@
       // Fill the missing kite role before redundant attacks,
       // below every learned upgrade. Stop once both roles are owned or the
       // main fusion already has two attacks; do not add a third core attack.
-      const missingGround = groundRank(m) && moves.some(move => move.kind === 'projectile') && !moves.some(groundRank);
-      const missingProjectile = m.kind === 'projectile' && moves.some(groundRank) && !moves.some(move => move.kind === 'projectile');
+      const missingGround = groundRank(m) && moves.some(rangedProjectile) && !moves.some(groundRank);
+      const missingProjectile = rangedProjectile(m) && moves.some(groundRank) && !moves.some(rangedProjectile);
       if (main.filter(damaging).length < 2 && (missingGround || missingProjectile)) {
         return 124.2 + groundRank(m) * 0.25 + clamp(moveValue(m, main),0,150) / 1000;
       }
@@ -759,7 +780,7 @@
       if (!main.some(damaging)) score = 150;
       // Escape a short-range starting build with a reliable ranged attack.
       if (main.filter(damaging).every(move => ['melee', 'dash', 'mine', 'trail'].includes(move.kind)) &&
-          ['projectile', 'beam', 'chain', 'meteor', 'turret'].includes(m.kind)) score += 38;
+          ['projectile', 'homing', 'bounce', 'beam', 'charge', 'chain', 'meteor', 'turret'].includes(m.kind)) score += 38;
       if (p.bonds > 0 && main.length < 4) score += 27;
       // A filled roster of unused alternatives delays the core build.
       if (p.slots.length >= 3 && !(p.bonds > 0)) score -= 15;
@@ -866,8 +887,27 @@
     const nearby = enemies.filter(e => distance(p, e) <= profile.reach);
     let hits = 1, eligible = true;
     switch (m.kind) {
-      case 'melee': case 'aura':
+      case 'melee': case 'aura': case 'shove':
         hits = Math.min(8, nearby.length); break;
+      case 'spin':
+        hits=Math.min(8,nearby.length)*Math.min(4,m.count || 1)*0.7; break;
+      case 'vortex': case 'stun': {
+        eligible=d<=300;
+        hits=Math.min(6,enemies.filter(e=>distance(e,target)<=(m.radius || 60)+(e.r || 12)).length);
+        if(m.kind==='vortex')hits*=Math.min(3,(m.dur || 2.6)/0.4)*0.6;
+        else hits*=0.75; // The delayed ground mark can miss a moving target.
+        break;
+      }
+      case 'quake': {
+        const ux=(target.x-p.x)/Math.max(1,d),uy=(target.y-p.y)/Math.max(1,d);
+        hits=0;
+        for(let i=1;i<=(m.count || 1);i++) {
+          const spot={x:p.x+ux*i*34,y:p.y+uy*i*34};
+          if(game.World.isWall?.(spot.x,spot.y))break;
+          hits+=enemies.filter(e=>distance(e,spot)<=(m.radius || 30)+(e.r || 12)).length*0.65;
+        }
+        hits=Math.min(8,hits);break;
+      }
       case 'orbit':
         hits = Math.min(5, enemies.filter(e => {
           const band = Math.hypot(e.x - p.x, (e.y - p.y) / 0.7);
@@ -884,14 +924,16 @@
         }
         hits = total; break;
       }
-      case 'projectile': case 'boomerang': case 'cone': {
+      case 'projectile': case 'homing': case 'bounce': case 'boomerang': case 'cone': {
         eligible = d <= (m.kind === 'boomerang' ? profile.reach + 40 : m.kind === 'cone' ? m.speed * m.life + 30 : 520);
         hits = fanCoverage(p, m, slot, enemies).hits;
+        if(m.kind==='bounce' && hits>0)hits*=1+Math.min(m.bounce || 0,
+          enemies.filter(e=>e!==target && distance(e,target)<=220).length)*0.45;
         // Only the outward pass is geometrically predicted; a return may hit again.
         if (m.kind === 'boomerang') hits *= 1.3;
         break;
       }
-      case 'beam': {
+      case 'beam': case 'charge': {
         eligible = d <= profile.reach;
         const ux = (target.x - p.x) / Math.max(1, d), uy = (target.y - p.y) / Math.max(1, d);
         const aligned = enemies.filter(e => {
@@ -900,11 +942,12 @@
         }).length;
         hits = Math.min(8, aligned);
         // Beams stop at walls; avoid choosing one that cannot hit its target.
-        if (m.kind === 'beam' && game.World.isWall) {
+        if (game.World.isWall) {
           for (let step = 16; step < d; step += 24) {
             if (game.World.isWall(p.x + ux * step, p.y + uy * step)) { eligible = false; break; }
           }
         }
+        if(m.kind==='charge')hits/=1+(m.charge || 0.75);
         break;
       }
       case 'meteor':
@@ -936,8 +979,10 @@
     if (game.Weather?.mult && m.type) multiplier *= game.Weather.mult(m.type);
     if (m.hex && (target.burn > 0 || target.poison > 0 || target.slow > 0 || slot.some(other => other !== m && control(other)))) multiplier *= m.hex;
     if (p.hp / p.maxHp < 0.4 && ['close', 'orbit', 'dash'].includes(profile.mode)) multiplier *= 0.65;
-    const status = (m.slow ? 1.12 : 1) * (m.burn || m.poison ? 1.08 : 1);
-    return (m.dmg || 0) * hits * multiplier * status;
+    const status = (m.slow ? 1.12 : 1) * (m.burn || m.poison ? 1.08 : 1)
+      * (m.drain && p.hp<p.maxHp*0.8 ? 1.35 : 1) * (m.stun || m.kind==='shove' ? 1.15 : 1);
+    const fit=game.Stats?.fit?.(p.mon,m.cat) || 1;
+    return (m.dmg || 0) * hits * multiplier * status * fit;
   }
   function rotationValue(p, slot, enemies, switching) {
     if (!slot?.length) return 0;
@@ -1071,7 +1116,7 @@
     const m=game.Moves.BY_ID[c.key.split(':')[1]], main=mainSlot(p).filter(damaging);
     return c.type === 'new' && m && main.length > 0
       && main.every(move => ['melee','dash','mine','trail'].includes(move.kind))
-      && ['projectile','beam','chain','meteor','turret'].includes(m.kind) && score >= 90;
+      && ['projectile','homing','bounce','beam','charge','chain','meteor','turret'].includes(m.kind) && score >= 90;
   }
   function rerollEarly(p,now) {
     if (!Number.isFinite(p.level) || p.level > 15 || p.level < 1) return false;
@@ -5849,7 +5894,295 @@
   "El veneno sigue quitando un porcentaje de la vida, pero contra enemigos con muchísima vida (los legendarios de la Sentencia) ese porcentaje es menor.": "中毒仍依體力比例造成傷害，但對體力極高的敵人（審判中的傳說寶可夢）效果會降低。",
   "Todos los rankings empiezan de cero (hoy, semana, mes, año e histórico): las marcas de huir de Arceus ya no se podrían alcanzar.": "每日、每週、每月、每年及歷史排行榜全部重置，因先前靠逃離阿爾宙斯達成的紀錄已無法重現。",
   "Seguridad: se ha cerrado un agujero por el que alguien podía meter código en su fila del ranking o en su perfil y hacer que se ejecutara en el navegador de quien los abría (a algunos les llevaba a un vídeo). Ahora todo lo que viene de otros jugadores se limpia, el servidor sólo deja guardar lo que debe, y el navegador no ejecuta nada que no sea del juego.": "安全修正：封堵了玩家在排行榜或個人檔案插入程式碼、於其他玩家瀏覽器中執行的漏洞（部分玩家曾被導向影片）。現在會清理其他玩家提供的資料，伺服器只接受合法內容，瀏覽器也只執行遊戲本身的程式碼。",
-  "En el ranking ya salen en shiny los Pokémon de quien jugó con su shiny.": "使用閃光寶可夢遊玩的玩家，排行榜現在會正確顯示閃光版本。"
+  "En el ranking ya salen en shiny los Pokémon de quien jugó con su shiny.": "使用閃光寶可夢遊玩的玩家，排行榜現在會正確顯示閃光版本。",
+  "Hiperrayo": "破壞光線",
+  "Hyper Beam": "破壞光線",
+  "Giro Rápido": "高速旋轉",
+  "Rapid Spin": "高速旋轉",
+  "Nitrocarga": "蓄能焰襲",
+  "Flame Charge": "蓄能焰襲",
+  "Torbellino": "潮旋",
+  "Whirlpool": "潮旋",
+  "Bomba Germen": "種子炸彈",
+  "Seed Bomb": "種子炸彈",
+  "Energibola": "能量球",
+  "Energy Ball": "能量球",
+  "Rayo Solar": "日光束",
+  "Solar Beam": "日光束",
+  "Onda Trueno": "電磁波",
+  "Thunder Wave": "電磁波",
+  "Bola Voltio": "電球",
+  "Electro Ball": "電球",
+  "Paranormal": "神通力",
+  "Extrasensory": "神通力",
+  "Bola Neblina": "薄霧球",
+  "Mist Ball": "薄霧球",
+  "Bomba Ácida": "酸液炸彈",
+  "Acid Spray": "酸液炸彈",
+  "Bucle Arena": "流沙地獄",
+  "Sand Tomb": "流沙地獄",
+  "Magnitud": "震級",
+  "Magnitude": "震級",
+  "Remolino": "吹飛",
+  "Whirlwind": "吹飛",
+  "Tajo Aéreo": "空氣斬",
+  "Air Slash": "空氣斬",
+  "Rayo Señal": "信號光束",
+  "Signal Beam": "信號光束",
+  "Ida y Vuelta": "急速折返",
+  "U-turn": "急速折返",
+  "Tumba Rocas": "岩石封鎖",
+  "Rock Tomb": "岩石封鎖",
+  "Poder Pasado": "原始之力",
+  "Ancient Power": "原始之力",
+  "Joya de Luz": "力量寶石",
+  "Power Gem": "力量寶石",
+  "Canto Helado": "冰礫",
+  "Ice Shard": "冰礫",
+  "Liofilización": "冷凍乾燥",
+  "Freeze-Dry": "冷凍乾燥",
+  "Patada Giro": "迴旋踢",
+  "Rolling Kick": "迴旋踢",
+  "Onda Vacío": "真空波",
+  "Vacuum Wave": "真空波",
+  "Puño Dinámico": "爆裂拳",
+  "Dynamic Punch": "爆裂拳",
+  "Sombra Vil": "影子偷襲",
+  "Shadow Sneak": "影子偷襲",
+  "Viento Aciago": "奇異之風",
+  "Ominous Wind": "奇異之風",
+  "Dragoaliento": "龍息",
+  "Dragon Breath": "龍息",
+  "Garra Dragón": "龍爪",
+  "Dragon Claw": "龍爪",
+  "Enfado": "逆鱗",
+  "Outrage": "逆鱗",
+  "Beso Drenaje": "吸取之吻",
+  "Draining Kiss": "吸取之吻",
+  "Carantoña": "嬉鬧",
+  "Play Rough": "嬉鬧",
+  "Voz Cautivadora": "魅惑之聲",
+  "Disarming Voice": "魅惑之聲",
+  "Disparo Espejo": "鏡光射擊",
+  "Mirror Shot": "鏡光射擊",
+  "Giro Bola": "陀螺球",
+  "Gyro Ball": "陀螺球",
+  "Golpe Bajo": "突襲",
+  "Sucker Punch": "突襲",
+  "Tajo Umbrío": "暗襲要害",
+  "Night Slash": "暗襲要害",
+  "Rayo Prisma": "稜鏡鐳射",
+  "Prismatic Laser": "稜鏡鐳射",
+  "Triataque": "三重攻擊",
+  "Tri Attack": "三重攻擊",
+  "Golpe Calor": "高溫重壓",
+  "Heat Crash": "高溫重壓",
+  "Salmuera": "鹽水",
+  "Brine": "鹽水",
+  "Mazazo": "木槌",
+  "Wood Hammer": "木槌",
+  "Cuchilla Solar": "日光刃",
+  "Solar Blade": "日光刃",
+  "Voltio Cruel": "瘋狂伏特",
+  "Volt Tackle": "瘋狂伏特",
+  "Chispa": "電光",
+  "Spark": "電光",
+  "Psicoonda": "精神波",
+  "Psywave": "精神波",
+  "Resplandor": "潔淨光芒",
+  "Luster Purge": "潔淨光芒",
+  "Onda Tóxica": "污泥波",
+  "Sludge Wave": "污泥波",
+  "Fuerza Equina": "十萬馬力",
+  "High Horsepower": "十萬馬力",
+  "Taladradora": "直衝鑽",
+  "Drill Run": "直衝鑽",
+  "Huracán": "暴風",
+  "Ataque Aéreo": "神鳥猛擊",
+  "Sky Attack": "神鳥猛擊",
+  "Megacuerno": "超級角擊",
+  "Megahorn": "超級角擊",
+  "Sanguijuela": "吸血",
+  "Leech Life": "吸血",
+  "Testarazo": "雙刃頭錘",
+  "Head Smash": "雙刃頭錘",
+  "Tormenta de Diamantes": "鑽石風暴",
+  "Diamond Storm": "鑽石風暴",
+  "Rayo Meteórico": "流星光束",
+  "Meteor Beam": "流星光束",
+  "Carámbano": "冰錐",
+  "Icicle Spear": "冰錐",
+  "Frío Polar": "絕對零度",
+  "Sheer Cold": "絕對零度",
+  "Patada Salto Alta": "飛膝踢",
+  "High Jump Kick": "飛膝踢",
+  "Puño Incremento": "增強拳",
+  "Power-Up Punch": "增強拳",
+  "Megapuño": "百萬噸重拳",
+  "Mega Punch": "百萬噸重拳",
+  "Garra Umbría": "暗影爪",
+  "Shadow Claw": "暗影爪",
+  "Golpe Umbrío": "暗影潛襲",
+  "Shadow Force": "暗影潛襲",
+  "Pulso Dragón": "龍之波動",
+  "Dragon Pulse": "龍之波動",
+  "Carga Dragón": "龍之俯衝",
+  "Dragon Rush": "龍之俯衝",
+  "Dracoflecha": "龍箭",
+  "Dragon Darts": "龍箭",
+  "Luz Lunar": "月光",
+  "Moonlight": "月光",
+  "Choque Anímico": "靈魂衝擊",
+  "Spirit Break": "靈魂衝擊",
+  "Encanto": "撒嬌",
+  "Charm": "撒嬌",
+  "Metaláser": "鐵蹄光線",
+  "Cuerpo Pesado": "重磅衝撞",
+  "Heavy Slam": "重磅衝撞",
+  "Juego Sucio": "欺詐",
+  "Foul Play": "欺詐",
+  "Lariat Oscuro": "ＤＤ金勾臂",
+  "Darkest Lariat": "ＤＤ金勾臂",
+  "Se carga un momento y suelta un rayo enorme que lo atraviesa todo.": "短暫蓄力後，發射貫穿一切的巨大光束。",
+  "Charges for a moment and fires a huge beam that pierces everything.": "短暫蓄力後，發射貫穿一切的巨大光束。",
+  "Giras sobre ti mismo golpeando todo lo que te rodea varias veces.": "原地旋轉，多次攻擊周圍所有敵人。",
+  "You spin in place, hitting everything around you several times.": "原地旋轉，多次攻擊周圍所有敵人。",
+  "Te lanzas envuelto en llamas y quemas todo el camino.": "包覆火焰突進，灼燒沿途所有敵人。",
+  "You dash wrapped in flames, burning everything in your path.": "包覆火焰突進，灼燒沿途所有敵人。",
+  "Un remolino que arrastra a los enemigos a su centro y los va dañando.": "產生漩渦，將敵人拉向中心並持續造成傷害。",
+  "A whirlpool that drags enemies into its center and keeps damaging them.": "產生漩渦，將敵人拉向中心並持續造成傷害。",
+  "Una semilla que rebota de enemigo en enemigo.": "在敵人之間反彈的種子。",
+  "A seed that bounces from enemy to enemy.": "在敵人之間反彈的種子。",
+  "Una bola de energía que persigue al enemigo.": "追蹤敵人的能量球。",
+  "A ball of energy that chases the enemy.": "追蹤敵人的能量球。",
+  "Absorbe luz un momento y la suelta en un rayo enorme.": "短暫吸收光線後，釋放巨大光束。",
+  "Absorbs light for a moment and releases it as a huge beam.": "短暫吸收光線後，釋放巨大光束。",
+  "Una descarga que avisa en el suelo y deja paralizados a los que pilla.": "在地面預告放電範圍，使命中的敵人麻痺。",
+  "A shock marked on the ground that paralyzes whoever it catches.": "在地面預告放電範圍，使命中的敵人麻痺。",
+  "Una bola eléctrica que salta de enemigo en enemigo.": "在敵人之間跳躍的電球。",
+  "An electric ball that jumps from enemy to enemy.": "在敵人之間跳躍的電球。",
+  "Una onda mental que daña y aparta a todos los que tienes cerca.": "精神波動對周圍敵人造成傷害並將其推開。",
+  "A mental wave that damages and pushes away everyone near you.": "精神波動對周圍敵人造成傷害並將其推開。",
+  "Una bola de bruma que persigue al enemigo y le frena.": "追蹤並減速敵人的霧球。",
+  "A ball of mist that chases the enemy and slows it down.": "追蹤並減速敵人的霧球。",
+  "Un chorro ácido que salta entre enemigos y los envenena.": "在敵人之間反彈並使其中毒的酸液。",
+  "An acid spray that jumps between enemies and poisons them.": "在敵人之間反彈並使其中毒的酸液。",
+  "Un remolino de arena que atrapa y arrastra a los enemigos.": "困住並吸引敵人的沙之漩渦。",
+  "A sand vortex that traps and drags enemies in.": "困住並吸引敵人的沙之漩渦。",
+  "El suelo revienta en línea delante de ti, onda tras onda.": "地面沿前方直線逐波爆裂。",
+  "The ground bursts in a line in front of you, wave after wave.": "地面沿前方直線逐波爆裂。",
+  "Un golpe de viento que barre a todos los que tienes cerca.": "以強風吹開附近所有敵人。",
+  "A gust of wind that sweeps away everyone near you.": "以強風吹開附近所有敵人。",
+  "Dos cuchillas de aire que buscan al enemigo.": "兩道追蹤敵人的空氣刀刃。",
+  "Two blades of air that seek out the enemy.": "兩道追蹤敵人的空氣刀刃。",
+  "Un destello que rebota entre los enemigos.": "在敵人之間反彈的閃光。",
+  "A flash that bounces between enemies.": "在敵人之間反彈的閃光。",
+  "Cruzas entre los enemigos golpeando a todos los del camino.": "穿越敵群，攻擊沿途所有敵人。",
+  "You dash through the enemies, hitting everyone in your path.": "穿越敵群，攻擊沿途所有敵人。",
+  "Caen rocas donde avisa el suelo y dejan atrapados a los que pilla.": "岩石落在地面預告區域，困住命中的敵人。",
+  "Rocks fall where the ground warns, trapping whoever they catch.": "岩石落在地面預告區域，困住命中的敵人。",
+  "Rocas antiguas que giran a tu alrededor.": "在周圍環繞的古老岩石。",
+  "Ancient rocks that circle around you.": "在周圍環繞的古老岩石。",
+  "Un destello de gema que rebota de enemigo en enemigo.": "在敵人之間反彈的寶石閃光。",
+  "A gem flash that bounces from enemy to enemy.": "在敵人之間反彈的寶石閃光。",
+  "Esquirlas rapidísimas que persiguen al enemigo.": "快速追蹤敵人的冰屑。",
+  "Super fast shards that chase the enemy.": "快速追蹤敵人的冰屑。",
+  "Un frío repentino que avisa en el suelo y deja congelados a los que pilla.": "在地面預告範圍內降下寒氣，凍住命中的敵人。",
+  "A sudden chill marked on the ground that freezes whoever it catches.": "在地面預告範圍內降下寒氣，凍住命中的敵人。",
+  "Patadas en giro que golpean todo lo que tienes alrededor.": "旋轉踢擊周圍所有敵人。",
+  "Spinning kicks that hit everything around you.": "旋轉踢擊周圍所有敵人。",
+  "Un puñetazo al aire que lanza una onda y aparta a los enemigos.": "向空中揮拳，釋放波動推開敵人。",
+  "A punch into the air that sends out a wave and pushes enemies away.": "向空中揮拳，釋放波動推開敵人。",
+  "Un puñetazo tremendo donde avisa el suelo: deja aturdidos a los que pilla.": "在地面預告區域重擊，使命中的敵人暈眩。",
+  "A tremendous punch where the ground warns: it stuns whoever it catches.": "在地面預告區域重擊，使命中的敵人暈眩。",
+  "Una sombra que se escurre por el suelo hasta el enemigo.": "沿地面追蹤敵人的影子。",
+  "A shadow that slips along the ground to the enemy.": "沿地面追蹤敵人的影子。",
+  "Un viento maldito que arremolina a los enemigos y los va dañando.": "詛咒之風將敵人聚集並持續造成傷害。",
+  "A cursed wind that swirls enemies together and keeps damaging them.": "詛咒之風將敵人聚集並持續造成傷害。",
+  "Un aliento de dragón en abanico corto que frena.": "短距離扇形龍息，使敵人減速。",
+  "A short fan of dragon breath that slows.": "短距離扇形龍息，使敵人減速。",
+  "Un zarpazo de dragón en arco.": "以龍爪進行弧形揮擊。",
+  "A dragon claw swipe in an arc.": "以龍爪進行弧形揮擊。",
+  "Una furia de golpes en giro que no deja a nadie en pie.": "猛烈旋轉連擊，掃倒周圍敵人。",
+  "A fury of spinning blows that leaves no one standing.": "猛烈旋轉連擊，掃倒周圍敵人。",
+  "Un beso que persigue al enemigo y te cura un poco al darle.": "追蹤敵人的吻，命中時回復少量體力。",
+  "A kiss that chases the enemy and heals you a little when it hits.": "追蹤敵人的吻，命中時回復少量體力。",
+  "Un ataque juguetón pero muy fuerte en arco.": "以嬉鬧動作發動強力弧形攻擊。",
+  "A playful but very strong attack in an arc.": "以嬉鬧動作發動強力弧形攻擊。",
+  "Un grito encantador que daña y aparta a los que tienes cerca.": "以迷人叫聲傷害並推開附近敵人。",
+  "A charming cry that damages and pushes away those near you.": "以迷人叫聲傷害並推開附近敵人。",
+  "Un destello metálico que rebota entre los enemigos.": "在敵人之間反彈的金屬閃光。",
+  "A metallic flash that bounces between enemies.": "在敵人之間反彈的金屬閃光。",
+  "Giras como una bola de acero golpeando todo alrededor.": "化為鋼球旋轉，攻擊周圍所有敵人。",
+  "You spin like a steel ball, hitting everything around.": "化為鋼球旋轉，攻擊周圍所有敵人。",
+  "Un golpe a traición que busca al enemigo.": "追蹤敵人的偷襲。",
+  "A sneaky blow that seeks out the enemy.": "追蹤敵人的偷襲。",
+  "Cortes en giro que alcanzan a todo lo que te rodea.": "旋轉斬擊周圍所有敵人。",
+  "Spinning slashes that reach everything around you.": "旋轉斬擊周圍所有敵人。",
+  "Carga más rápido y -20% recarga": "加快蓄力，冷卻時間 -20%",
+  "Charges faster and -20% cooldown": "加快蓄力，冷卻時間 -20%",
+  "+25% radio": "範圍 +25%",
+  "+25% radius": "範圍 +25%",
+  "+1 vuelta": "旋轉次數 +1",
+  "+1 spin": "旋轉次數 +1",
+  "-25% recarga y +30% daño": "冷卻時間 -25%，傷害 +30%",
+  "-25% cooldown and +30% damage": "冷卻時間 -25%，傷害 +30%",
+  "Atrae más fuerte y +40% daño": "增強牽引力，傷害 +40%",
+  "Pulls harder and +40% damage": "增強牽引力，傷害 +40%",
+  "+1 rebote": "反彈次數 +1",
+  "+1 bounce": "反彈次數 +1",
+  "+1 proyectil y +1 rebote": "投射物 +1，反彈次數 +1",
+  "+1 projectile and +1 bounce": "投射物 +1，反彈次數 +1",
+  "+1 proyectil y +40% daño": "投射物 +1，傷害 +40%",
+  "+1 projectile and +40% damage": "投射物 +1，傷害 +40%",
+  "+50% aturdimiento": "暈眩時間 +50%",
+  "+50% stun": "暈眩時間 +50%",
+  "+50% empuje y +40% daño": "擊退力 +50%，傷害 +40%",
+  "+50% push and +40% damage": "擊退力 +50%，傷害 +40%",
+  "+2 ondas": "震波 +2",
+  "+2 waves": "震波 +2",
+  "+25% tamaño": "大小 +25%",
+  "+25% size": "大小 +25%",
+  "-25% recarga y +2 ondas": "冷卻時間 -25%，震波 +2",
+  "-25% cooldown and +2 waves": "冷卻時間 -25%，震波 +2",
+  "×1,8 daño, +2 proyectiles y más grandes": "傷害 ×1.8，投射物 +2 並增大",
+  "×1.8 damage, +2 projectiles and bigger": "傷害 ×1.8，投射物 +2 並增大",
+  "×1,8 daño, +2 rebotes y +1 proyectil": "傷害 ×1.8，反彈次數 +2，投射物 +1",
+  "×1.8 damage, +2 bounces and +1 projectile": "傷害 ×1.8，反彈次數 +2，投射物 +1",
+  "×1,8 daño, rayo un 50% más grueso y carga más rápido": "傷害 ×1.8，光束增粗 50% 並加快蓄力",
+  "×1.8 damage, 50% thicker beam and faster charge": "傷害 ×1.8，光束增粗 50% 並加快蓄力",
+  "×1,8 daño, +1 vuelta y más radio": "傷害 ×1.8，旋轉次數 +1 並擴大範圍",
+  "×1.8 damage, +1 spin and more radius": "傷害 ×1.8，旋轉次數 +1 並擴大範圍",
+  "×1,8 daño, +3 ondas y ondas más grandes": "傷害 ×1.8，震波 +3 並增大",
+  "×1.8 damage, +3 waves and bigger waves": "傷害 ×1.8，震波 +3 並增大",
+  "×1,8 daño, más radio y atrae más fuerte": "傷害 ×1.8，擴大範圍並增強牽引力",
+  "×1.8 damage, more radius and stronger pull": "傷害 ×1.8，擴大範圍並增強牽引力",
+  "×1,8 daño, más radio y empuja más": "傷害 ×1.8，擴大範圍並增強擊退力",
+  "×1.8 damage, more radius and stronger push": "傷害 ×1.8，擴大範圍並增強擊退力",
+  "×1,8 daño, más radio y aturde más rato": "傷害 ×1.8，擴大範圍並延長暈眩時間",
+  "×1.8 damage, more radius and longer stun": "傷害 ×1.8，擴大範圍並延長暈眩時間",
+  "Movimiento inicial": "起始招式",
+  "Starting move": "起始招式",
+  "Eliges con qué ataque empiezas la partida": "選擇開局使用的招式",
+  "Choose which move you start the run with": "選擇開局使用的招式",
+  "Elegir: {x}": "選擇：{x}",
+  "Choose: {x}": "選擇：{x}",
+  "Elige con qué ataque empieza. Lo puedes cambiar cuando quieras, gratis.": "選擇開局招式，可隨時免費更換。",
+  "Choose which move it starts with. You can change it any time, for free.": "選擇開局招式，可隨時免費更換。",
+  "(de serie)": "（預設）",
+  "(default)": "（預設）",
+  "{x} empezará con {x}": "{x} 將以 {x} 開局",
+  "{x} will start with {x}": "{x} 將以 {x} 開局",
+  "Monotipo: +20 % de daño con sus ataques de tipo {x}": "單一屬性：{x} 屬性招式傷害 +20%",
+  "Single type: +20% damage with its {x}-type moves": "單一屬性：{x} 屬性招式傷害 +20%",
+  "homing": "追蹤投射",
+  "bounce": "反彈投射",
+  "charge": "蓄力光束",
+  "spin": "旋轉連擊",
+  "quake": "地面震波",
+  "vortex": "牽引漩渦",
+  "shove": "擊退波動",
+  "stun": "暈眩區域"
 };
   const exact = new Map(), lower = new Map(), fragments = new Map(), patterns = [];
   const cache = new Map(), translatedNodes = new WeakMap();
