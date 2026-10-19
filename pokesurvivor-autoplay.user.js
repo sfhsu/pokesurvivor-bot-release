@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.24
+// @version      1.4.25
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.24';
+  const VERSION = '1.4.25';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -192,6 +192,7 @@
   let originalBond, hookedBond, bondChoice = carry?.bondChoice || null;
   let originalItem, hookedItem, itemChoice = carry?.itemChoice || null;
   let turrets = [], seenCasts = new Map();
+  let vortices = carry?.vortices || [], combatHooks = [];
   let terrain = null, escapeState = '', objectiveScan = null;
   let projectileCoverCache = new Map();
   let coverLifetimeCache = new Map();
@@ -440,6 +441,7 @@
       return vector;
     };
     g.Input.axis = hookedAxis;
+    observeVortices(g);
     originalOffer = g.LevelUp.offer;
     hookedOffer = function (...args) {
       const list = originalOffer.apply(this, args);
@@ -466,6 +468,91 @@
       };
       g.RunUI.showBond = hookedBond;
     }
+  }
+  function observeVortices(g) {
+    const combat=g.Combat;
+    if(!combat || typeof combat.tick!=='function' || typeof combat.updateFields!=='function') return;
+    const wrap=(name,create)=>{
+      const original=combat[name];
+      if(typeof original!=='function')return;
+      const hook=create(original);combat[name]=hook;
+      combatHooks.push(()=>{if(combat[name]===hook)combat[name]=original;});
+    };
+    wrap('tick',original=>function(dt,p,...args) {
+      if(p!==g.Game.player || p.dead || typeof p.cast!=='function' ||
+        !(p.slots?.[p.active] || []).some(m=>m.kind==='vortex'))return original.call(this,dt,p,...args);
+      const pending=[],cast=p.cast,castDescriptor=Object.getOwnPropertyDescriptor(p,'cast');
+      const hook=function(m,...values) {
+        const result=cast.call(this,m,...values);
+        // Sample immediately before this move runs, after earlier fused moves.
+        if(m.kind==='vortex') {
+          const target=p.target && !p.target.dead && p.target.hurt && distance(p,p.target)<=300 ? p.target
+            : g.Projectiles.nearest?.(g.EnemyMgr.all(),p.x,p.y,300);
+          pending.push({owner:p,x:target?.x ?? p.x+Math.cos(p.aim || 0)*120,
+            y:target?.y ?? p.y+Math.sin(p.aim || 0)*100,r:m.radius || 72,
+            remaining:m.dur || 2.6,pull:m.pull || 140});
+        }
+        return result;
+      };
+      p.cast=hook;
+      let result;
+      try {result=original.call(this,dt,p,...args);}
+      finally {if(p.cast===hook) {
+        if(castDescriptor)Object.defineProperty(p,'cast',castDescriptor);else delete p.cast;
+      }}
+      if(pending.length)vortices=[...vortices.filter(f=>f.owner===p),...pending].slice(-2);
+      return result;
+    });
+    wrap('updateFields',original=>function(dt,...args) {
+      const result=original.call(this,dt,...args);
+      // Use simulation dt, so pausing or background throttling cannot expire
+      // a field early, and changing attack slots does not remove it.
+      for(const f of vortices)f.remaining-=Math.max(0,dt);
+      vortices=vortices.filter(f=>f.remaining>0 && !f.owner.dead);
+      return result;
+    });
+    wrap('clearFields',original=>function(owner,...args) {
+      const result=original.call(this,owner,...args);
+      vortices=owner ? vortices.filter(f=>f.owner!==owner) : [];
+      return result;
+    });
+  }
+  function vortexPosition(p,plan,enemies,priority=1) {
+    let score=0;
+    if(p.hp/p.maxHp<0.35)priority=0;
+    const q=plan.at(Math.min(0.65,plan.horizon));
+    for(const f of vortices) {
+      if(f.owner!==p || f.remaining<=0)continue;
+      const crowd=enemies.filter(e=>!e.dead && distance(e,f)<f.r*1.4+100);
+      if(!crowd.length)continue;
+      const margin=p.r+Math.max(12,...crowd.map(e=>e.r || 12))+22+bodyCaution(p)*18;
+      const safe=f.r*1.4+margin;
+      let closest=distance(p,f);
+      for(const seg of plan.segments) {
+        if(seg.start>=f.remaining)break;
+        const duration=Math.min(seg.end,f.remaining)-seg.start;
+        const vv=seg.vx**2+seg.vy**2;
+        const t=vv ? clamp(((f.x-seg.x)*seg.vx+(f.y-seg.y)*seg.vy)/vv,0,duration) : 0;
+        closest=Math.min(closest,Math.hypot(seg.x+seg.vx*t-f.x,seg.y+seg.vy*t-f.y));
+      }
+      // A friendly vortex does not hurt us; the enemies it gathers do.
+      // Never discount real pursuit/projectile danger on the promise of a pull.
+      if(closest<safe)score-=Math.min(650,(safe-closest)*4);
+      const d=distance(q,f);
+      if(distance(p,f)<safe)score+=clamp(d-distance(p,f),-80,80)*3;
+      if(d<safe || f.remaining<0.35)continue;
+      let lured=0;
+      for(const e of enemies) {
+        if(e.dead || e.boss || e.judge || e.remote || e.keepsDistance?.() || e.behavior==='thief' || e.phase==='dash')continue;
+        const dx=q.x-e.x,dy=q.y-e.y,vv=dx*dx+dy*dy;
+        const u=vv ? ((f.x-e.x)*dx+(f.y-e.y)*dy)/vv : -1;
+        const arrival=Math.max(0,distance(e,f)-f.r*1.4)/Math.max(1,e.spd || 0);
+        if(u>0 && u<1 && arrival<Math.min(1.8,f.remaining) &&
+          Math.hypot(e.x+dx*u-f.x,e.y+dy*u-f.y)<f.r)lured++;
+      }
+      score+=priority*(65*Math.exp(-Math.abs(d-(safe+30))/65)+Math.min(3,lured)*24);
+    }
+    return score;
   }
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
   const learned = p => p.moves || p.slots.flat();
@@ -1802,6 +1889,7 @@
     coverLifetimeCache.clear();
     const liveEnemies = game.EnemyMgr.all().filter(e => !e.dead && distance(e,p) < 1200);
     const enemies = liveEnemies.filter(e => (distance(e, p) < 560 || e.phase === 'dash')).sort((a, b) => distance(a, p) - distance(b, p));
+    vortices=vortices.filter(f=>f.owner===p && f.remaining>0);
     const map = buildTerrain(p, now);
     const hostileShots = game.Projectiles.all().filter(s => !s.friendly);
     const hazards = (game.Hazards?.all || []).filter(h => !h.hit);
@@ -1828,6 +1916,7 @@
     }
     turrets = turrets.filter(t => t.until > now);
     tactic = profile ? ({ close: '近距離收放', orbit: '環繞切邊', ranged: '保持射程', lure: '鋪場誘敵', turret: '砲台牽制', dash: '突進收放' })[profile.mode] : '撿物';
+    if(vortices.some(f=>f.owner===p && f.remaining>0))tactic='漩渦聚怪 · 外圈風箏';
     const speed = p.frozen ? 0 : Math.max(0,p.spd ?? p.baseSpd ?? 100);
     const horizon = Math.min(survivalHorizon(p,speed),hostileShots.length || enemies.length || hazards.length ? Infinity : 1.2);
     // A fast incoming shot can be dangerous well outside the old 330px window.
@@ -1915,6 +2004,7 @@
         }
       }
       score += attackPosition(p, q, enemies, profile) * (objective?.urgent ? 0 : objective?.kind==='hunt' ? 0.65 : objective ? 0.35 : 1);
+      score += vortexPosition(p,plan,enemies,objective?.urgent ? 0 : objective ? 0.35 : 1);
       if(thief && targetFor({x:q.x,y:q.y,r:p.r},group,enemies)===thief) score+=110;
       if (objective) score += objectiveScore(p,q,dir,objective,waypoint);
       for (const turret of turrets) {
@@ -2032,6 +2122,8 @@
     $('rotation').textContent = [rotation || '等待目標', escapeState].filter(Boolean).join(' · ');
   }
   function detachHooks() {
+    for(const restore of combatHooks)restore();
+    combatHooks=[];
     if(bondPlayer && hookedBondOptions && bondPlayer.bondOptions===hookedBondOptions) bondPlayer.bondOptions=originalBondOptions;
     bondPlayer=null;originalBondOptions=null;hookedBondOptions=null;
     if (!game) return;
@@ -2069,7 +2161,7 @@
     },
     reload: reloadBot,
     handoff() {
-      const state = { game: game || capturedGame, offers, offered, bondChoice, itemChoice, rerollState, settings: { ...settings } };
+      const state = { game: game || capturedGame, offers, offered, bondChoice, itemChoice, rerollState, vortices, settings: { ...settings } };
       api.destroy();
       return state;
     },
@@ -2079,7 +2171,7 @@
       window.visualViewport?.removeEventListener('resize',onPanelResize);
       window.visualViewport?.removeEventListener('scroll',onPanelResize);
       stopped = true; clearInterval(timer); releaseCapture(); capturedGame = null; captureCandidates.length = 0; vector = [0, 0]; root.remove();
-      detachHooks(); backgroundRunner?.destroy();
+      detachHooks(); vortices=[]; backgroundRunner?.destroy();
       removeEventListener('keydown', onDown); removeEventListener('keyup', onUp); removeEventListener('blur', onBlur);
       if (window.PokeSurvivorBot === api) delete window.PokeSurvivorBot;
     }
