@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokéSurvivor iPhone 自動遊玩
 // @namespace    pokesurvivor-bot
-// @version      1.4.25
+// @version      1.4.26
 // @description  依體型預判躲彈與敵人追擊、散射彈幕走位、地形風箏、冷卻選招、自動使用祭壇、開箱與進裂縫打王；觸控優先，可重新載入 Bot，單人背景續跑可切換（受瀏覽器限制），附穩定啟動與 GF 更新入口。
 // @match        https://pokesurvivor.com/*
 // @match        https://www.pokesurvivor.com/*
@@ -17,7 +17,7 @@
 (async () => {
   'use strict';
   if (window.top !== window.self) return;
-  const VERSION = '1.4.25';
+  const VERSION = '1.4.26';
   const UPDATE_URL = 'https://update.greasyfork.org/scripts/600296/Pok%C3%A9Survivor%20iPhone%20%E8%87%AA%E5%8B%95%E9%81%8A%E7%8E%A9.user.js';
   const existing = window.PokeSurvivorBot;
   if (existing?.version === VERSION) { existing.reload(); return; }
@@ -182,6 +182,7 @@
   try { restoreSettings(JSON.parse(localStorage.getItem(key) || '{}')); } catch (_) {}
   restoreSettings(carry?.settings);
   let backgroundRunner = null;
+  let ticketBusy=false,ticketMessage='',ticketAccount=null;
   let game, originalAxis, originalOffer, hookedAxis, hookedOffer;
   let dodgeStop = null;
   let vector = [0, 0], offers = carry?.offers || [], offered = carry?.offered || null, lastChoice = 0;
@@ -218,6 +219,7 @@
     .body{min-height:0;overflow-y:auto;overscroll-behavior:contain;border-top:1px solid #65849a2b;padding:12px}.body[hidden]{display:none}.row{display:flex;align-items:center;justify-content:space-between;gap:8px}.label{color:#8faabe;font-size:10px;letter-spacing:1px}.hp-value{font-variant-numeric:tabular-nums;color:#c5e7d9;font-size:11px}.hp-track{height:4px;background:#2b4253;border-radius:5px;overflow:hidden;margin:6px 0 12px}.hp-fill{height:100%;width:0;background:linear-gradient(90deg,#45bca0,#a4edb9);transition:width .3s}
     #tactic{color:#d5c296;font-size:11px}.slots{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin:7px 0 12px}.slot{position:relative;min-height:62px;padding:7px 5px;border:1px solid #5b81953b;border-radius:10px;background:#0b1a2b85;overflow:hidden}.slot[data-active=true]{border-color:#7ce0c5aa;background:#244b4c77;box-shadow:inset 0 0 14px #79e8ce09}.slot-number{font-size:9px;color:#7799b0}.slot-name{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:10px;color:#dce9f2;margin:2px 0}.slot-cd{color:#8da8bd;font-size:9px;font-variant-numeric:tabular-nums}.slot[data-active=true] .slot-cd{color:#8fe2c7}.cd-track{position:absolute;height:2px;background:#68cdb1;bottom:0;left:0;width:0;transition:width .12s}
     .rotation-note{margin:-5px 0 10px;color:#7fa6be;font-size:10px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.actions button{font-size:11px}#restart[aria-pressed=true]{background:#4d4532;border-color:#c8ac6a88;color:#ffe2a0}#reload{background:#284457;color:#d8eafa}.hint{margin:9px 1px 0;color:#6f91a8;font-size:10px;text-align:center}
+    .tickets{margin-top:10px;padding:10px;border:1px solid #67849e55;border-radius:12px}.tickets summary{cursor:pointer;min-height:32px}.tickets input{font:inherit;font-size:16px;width:100%;min-height:44px;margin:6px 0;padding:8px;border:1px solid #67849e;color:#e7efff;background:#102331;border-radius:8px}.tickets button{width:100%}.tickets p{margin:5px 0;color:#9cb6c9;font-size:11px}button:disabled{opacity:.5;cursor:default}
     @media(max-height:430px){header{padding:8px 10px 6px}.body{padding:9px 10px}.slots{margin-bottom:9px}.slot{min-height:54px;padding:5px}.hp-track{margin-bottom:8px}.hint{display:none}}
     @media(prefers-reduced-motion:reduce){*{transition:none!important}}
   </style><div class="panel">
@@ -226,7 +228,7 @@
     <div class="body"><div class="row"><span class="label">HP</span><span id="hp" class="hp-value">— / —</span></div><div class="hp-track"><div id="hp-fill" class="hp-fill"></div></div>
     <div class="row"><span class="label">招式輪替</span><span id="tactic">準備就緒</span></div><div class="slots">
     ${[0, 1, 2, 3].map(i => `<div id="slot-${i}" class="slot" data-active="false"><span class="slot-number">0${i + 1}</span><span id="move-${i}" class="slot-name">空槽</span><span id="cd-${i}" class="slot-cd">—</span><div id="bar-${i}" class="cd-track"></div></div>`).join('')}
-    </div><p id="rotation" class="rotation-note">等待目標</p><div class="actions"><button id="restart" aria-pressed="false">自動重開：關</button><button id="manual-points" aria-pressed="false" title="單人手動選牌、重抽、融合與道具；自動走位和戰鬥繼續">手動加點：關</button><button id="reload">↻ 重新載入 Bot</button><button id="background" aria-pressed="true" title="單人背景續跑；iPhone 切換 App、鎖屏或系統掛起後仍可能停止">背景續跑：開</button></div><p class="update-note">背景續跑受瀏覽器限制；多人背景維持原暫停機制</p><a id="stable" class="update-link" href="/guia/?poke-bot-launch=1" title="重新開啟穩定入口，先準備 Bot 再載入遊戲；目前本局會結束">穩定啟動 · 重開網頁</a><a id="update" class="update-link" href="${UPDATE_URL}" target="_blank" rel="noopener noreferrer" title="開啟 Greasy Fork 最新腳本，由 Userscripts 確認更新；更新後請重整遊戲以載入新版" aria-describedby="update-note">↑ 更新版本 · Greasy Fork ↗</a><p id="update-note" class="update-note">新分頁確認更新；套用新版需重整遊戲</p><p class="hint">觸控移動優先 · 重新載入保留本局</p></div>
+    </div><p id="rotation" class="rotation-note">等待目標</p><div class="actions"><button id="restart" aria-pressed="false">自動重開：關</button><button id="manual-points" aria-pressed="false" title="單人手動選牌、重抽、融合與道具；自動走位和戰鬥繼續">手動加點：關</button><button id="reload">↻ 重新載入 Bot</button><button id="background" aria-pressed="true" title="單人背景續跑；iPhone 切換 App、鎖屏或系統掛起後仍可能停止">背景續跑：開</button></div><p class="update-note">背景續跑受瀏覽器限制；多人背景維持原暫停機制</p><a id="stable" class="update-link" href="/guia/?poke-bot-launch=1" title="重新開啟穩定入口，先準備 Bot 再載入遊戲；目前本局會結束">穩定啟動 · 重開網頁</a><a id="update" class="update-link" href="${UPDATE_URL}" target="_blank" rel="noopener noreferrer" title="開啟 Greasy Fork 最新腳本，由 Userscripts 確認更新；更新後請重整遊戲以載入新版" aria-describedby="update-note">↑ 更新版本 · Greasy Fork ↗</a><p id="update-note" class="update-note">新分頁確認更新；套用新版需重整遊戲</p><details class="tickets"><summary>十連券數量</summary><p id="ticket-current">等待存檔</p><label for="ticket-count">設定總張數（不是增加張數）</label><input id="ticket-count" type="number" inputmode="numeric" min="0" max="1000000000" step="1" placeholder="輸入總張數"><button id="ticket-apply">套用並儲存</button><p id="ticket-result" role="status" aria-live="polite"></p></details><p class="hint">觸控移動優先 · 重新載入保留本局</p></div>
   </div><button id="restore" hidden aria-label="展開 Bot 面板" title="點一下展開；拖曳可移動"><span class="ball" aria-hidden="true"></span><span class="mini-dot" aria-hidden="true"></span></button>`;
   const $ = id => shadow.getElementById(id);
   const persist = () => { try { localStorage.setItem(key, JSON.stringify(settings)); } catch (_) {} };
@@ -254,6 +256,42 @@
   $('toggle').onclick = () => { settings.enabled = !settings.enabled; vector = [0, 0]; error = ''; persist(); controls(); };
   $('restart').onclick = () => { if (multiplayer()) return; settings.restart = !settings.restart; overSince = 0; persist(); controls(); };
   $('manual-points').onclick = () => { if(multiplayer()) return; settings.manualPoints=!settings.manualPoints; persist(); controls(); };
+  function renderTickets() {
+    const db=game?.DB,save=db?.save;
+    if(save!==ticketAccount) {ticketAccount=save;ticketMessage='';$('ticket-count').value='';}
+    const ready=!!save?.tickets && !db.guest && typeof db.commit==='function';
+    $('ticket-current').textContent=save?.tickets ? `目前：${save.tickets.t10 ?? 0} 張十連券` : '等待存檔';
+    $('ticket-apply').disabled=ticketBusy || !ready;
+    $('ticket-count').disabled=ticketBusy || !ready;
+    $('ticket-result').textContent=ticketMessage || (db?.guest ? '訪客不保存，請先登入帳號。' : !ready ? '等待取得可儲存的遊戲帳號。' : '套用後儲存至目前登入的帳號。');
+  }
+  for(const type of ['keydown','keyup'])$('ticket-count').addEventListener(type,e=>e.stopPropagation());
+  $('ticket-apply').onclick=async()=>{
+    if(ticketBusy || stopped)return;
+    renderTickets();
+    const db=game?.DB,save=db?.save,text=String($('ticket-count').value ?? '').trim();
+    if(!save?.tickets || db.guest || typeof db.commit!=='function')return;
+    if(!/^\d+$/.test(text) || !Number.isSafeInteger(Number(text)) || Number(text)>1000000000) {
+      ticketMessage='請輸入 0～1,000,000,000 的整數。';renderTickets();return;
+    }
+    ticketBusy=true;ticketMessage='正在儲存…';renderTickets();
+    try {
+      save.tickets.t10=Number(text);
+      const committed=db.commit();
+      game?.UI?.refreshCoins?.();
+      if(!committed || db.storageOk===false)throw Error('本機存檔未成功，請檢查瀏覽器儲存空間。');
+      if(db.mode!=='cloud')ticketMessage='已儲存至本機。';
+      else {
+        const result=await db.saveNow?.();
+        if(stopped || game?.DB!==db || db.save!==save)return;
+        if(result?.ok && result.why==='wait')ticketMessage=`已存本機，雲端等待約 ${result.secs || 65} 秒。`;
+        else if(result?.ok && !['local','guest'].includes(result.why))ticketMessage='已同步雲端。';
+        else ticketMessage=result?.why==='offline' ? '已存本機；目前離線，尚未同步雲端。' : '已存本機；雲端尚未確認，請稍後按遊戲儲存。';
+      }
+    }catch(e) {
+      if(!stopped && game?.DB===db && db.save===save)ticketMessage=`儲存未完成：${e.message}`;
+    }finally {ticketBusy=false;if(!stopped)renderTickets();}
+  };
   $('background').onclick = () => { settings.background = !settings.background; vector = [0,0]; persist(); controls(); };
   $('fold').onclick = () => { settings.collapsed = !settings.collapsed; persist(); controls(); };
   $('reload').onclick = () => {
@@ -2101,6 +2139,7 @@
     }
   }
   function renderPanel() {
+    renderTickets();
     renderRestart();
     renderManualPoints();
     renderReload();
